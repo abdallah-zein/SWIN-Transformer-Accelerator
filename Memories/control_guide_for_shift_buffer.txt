@@ -1,0 +1,186 @@
+// =============================================================================
+// unified_controller_sb_additions.sv
+//
+// ── What this file contains ───────────────────────────────────────────────────
+// This is NOT a standalone module.  It shows the exact text to INSERT into
+// unified_controller.sv to wire the shift_buffer to the controller.
+//
+// Three insertion points are required (marked A, B, C below).
+// Search for the anchor comment in unified_controller.sv and paste the block
+// immediately after it.
+//
+// =============================================================================
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INSERTION POINT A — add after the last ILB parameter in the parameter list
+//
+// In unified_controller.sv, find:
+//   parameter int ILB_FFN1_BASE = 20588
+// and add the following BEFORE the closing ')(' of the parameter list:
+// ─────────────────────────────────────────────────────────────────────────────
+
+//   // ── Shift buffer parameters ──────────────────────────────────────────────
+//   // These must match the DEPTH and layout in shift_buffer.sv / full_system_top.sv.
+//   // Entry counts per operation:
+//   //   Conv : 96 kernels × 56 output rows            = 5 376 entries  [0 .. 5375]
+//   //   MLP  : 448 row-groups (3136 rows / 7)         =   448 entries  [5376 .. 5823]
+//   //          (same 448-entry table reused by L1 and L2 within one MLP pass)
+//   //   MHA  : all sub-ops per 7×7 window             = 7 749 entries  [5824 .. 13572]
+//   //          Layout within MHA window (sequential):
+//   //            QKV   : 96 cols × 7 groups × 3 mats  = 2 016
+//   //            ATTN  : 49 cols × 7 groups × 3 heads = 1 029
+//   //            SxV   : 32 cols × 7 groups × 3 heads =   672
+//   //            PROJ  : 96 cols × 7 groups            =   672
+//   //            FFN1  : 384 cols × 7 groups           = 2 688
+//   //            FFN2  : 96 cols × 7 groups            =   672
+//   parameter int SB_AW         = 14,    // must match shift_buffer AW = log2(DEPTH)
+//   parameter int SB_CONV_BASE  = 0,     // entry base for Conv shift table
+//   parameter int SB_MLP_BASE   = 5376,  // entry base for MLP shift table
+//   parameter int SB_MHA_BASE   = 5824   // entry base for MHA shift table (per window)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INSERTION POINT B — add after the last output port in the port list
+//
+// In unified_controller.sv, find:
+//   output logic           omem_fb_en_ctrl
+// and add the following BEFORE the closing ');' of the port list:
+// ─────────────────────────────────────────────────────────────────────────────
+
+//   // ── Shift buffer control ──────────────────────────────────────────────────
+//   // sb_op_start     : one-cycle pulse when a new operation begins (or each new
+//   //                   MHA window).  Carries the entry base address that the
+//   //                   shift_buffer will reset its read pointer to.
+//   // sb_op_base_addr : entry address of the first shift value for this op.
+//   // sb_advance      : one-cycle pulse after every completed 7-element row-group
+//   //                   writeback, causing the shift_buffer to step to the next
+//   //                   shift value for the following row-group.
+//   output logic              sb_op_start,
+//   output logic [SB_AW-1:0]  sb_op_base_addr,
+//   output logic              sb_advance
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INSERTION POINT C — add before the closing 'endmodule' of unified_controller
+//
+// Paste the entire always_comb block below verbatim:
+// ─────────────────────────────────────────────────────────────────────────────
+
+// =============================================================================
+// Shift Buffer control
+// =============================================================================
+// Drives three new outputs that the shift_buffer module consumes:
+//
+//   sb_op_start / sb_op_base_addr
+//     Asserted once per new top-level operation (Conv, MLP, MHA).
+//     Also asserted when MLP transitions from L1 to L2 (resets the pointer
+//     to the same MLP base so L2 reuses the same 448-entry shift table).
+//     Also asserted at each new MHA window boundary (same 7 749-entry table
+//     is reused for every window because weights — and therefore scaling
+//     factors — are constant across all 64 windows).
+//
+//   sb_advance
+//     Pulsed once per completed 7-element row-group for every operation.
+//     Causes the shift_buffer to present the next shift value to the
+//     rounding_shifter in time for the following row-group writeback.
+//
+//   Priority rule (enforced inside shift_buffer.sv):
+//     sb_op_start beats sb_advance on any cycle where both are asserted.
+//     The only case where this can happen is S_M_L1_NEXT_COL with
+//     m_last_l1_col (last L1 column): sb_advance fires for the last L1
+//     row-group while sb_op_start simultaneously resets for L2.
+//     The op_start wins — the pointer is placed at SB_MLP_BASE and the
+//     last L1 advance is discarded (irrelevant since L1 is done).
+// =============================================================================
+always_comb begin : shift_buf_ctrl
+    sb_op_start     = 1'b0;
+    sb_op_base_addr = '0;
+    sb_advance      = 1'b0;
+
+    // ── sb_op_start ──────────────────────────────────────────────────────────
+
+    if (state == S_IDLE && start) begin
+        // Arm the shift buffer at the very beginning of any operation.
+        sb_op_start = 1'b1;
+        case (mode)
+            2'b00:   sb_op_base_addr = SB_AW'(SB_CONV_BASE);
+            2'b01:   sb_op_base_addr = SB_AW'(SB_MLP_BASE);
+            2'b10:   sb_op_base_addr = SB_AW'(SB_MHA_BASE);
+            default: sb_op_base_addr = '0;
+        endcase
+    end
+
+    // MLP Layer 2: reset read pointer back to MLP base so L2 reuses the
+    // same 448 shift values that were used for L1.
+    // Triggered at the last column of L1 (next state → S_M_L2_PRELOAD0).
+    else if (state == S_M_L1_NEXT_COL && m_last_l1_col) begin
+        sb_op_start     = 1'b1;
+        sb_op_base_addr = SB_AW'(SB_MLP_BASE);
+    end
+
+    // MHA new window: each of the 64 windows uses the same weight matrices
+    // and therefore the same shift values.  Reset the pointer at the start
+    // of every new window so the 7 749-entry table is replayed identically.
+    else if (state == S_H_NEXT_WINDOW && !h_last_win) begin
+        sb_op_start     = 1'b1;
+        sb_op_base_addr = SB_AW'(SB_MHA_BASE);
+    end
+
+    // ── sb_advance ───────────────────────────────────────────────────────────
+    // One pulse per 7-element row-group completion for each operation.
+    // The shift_buffer increments its read pointer so the next shift value
+    // is already at the output before the following row-group's writeback.
+
+    // ── Convolution ──────────────────────────────────────────────────────────
+    // The same (kernel, row_group) shift value spans all 8 chunks
+    // (c_chunk_idx 0..7).  Advance only when the last chunk finishes,
+    // i.e. when c_last_chunk is true in S_C_NEXT.
+    // Total advances: 96 kernels × 56 output rows = 5 376.
+    if (state == S_C_NEXT && c_last_chunk)
+        sb_advance = 1'b1;
+
+    // ── MLP ──────────────────────────────────────────────────────────────────
+    // One shift value covers all output columns for one 7-row row-group.
+    // Advance once per row-group transition (S_M_NEXT_ROW).
+    // Total advances per layer: 448.  The pointer is reset to SB_MLP_BASE
+    // for L2 via the sb_op_start path above, so L2 replays the same 448
+    // entries.
+    if (state == S_M_NEXT_ROW)
+        sb_advance = 1'b1;
+
+    // ── MHA — QKV projection ─────────────────────────────────────────────────
+    // Each (patch_group, output_column) pair produces one 7-element vector.
+    // Advance at every S_H_NEXT_QKV_COL (fires 96 times per patch-group,
+    // 7 patch-groups, 3 matrices Q/K/V → 2 016 advances per window).
+    if (state == S_H_NEXT_QKV_COL)
+        sb_advance = 1'b1;
+
+    // ── MHA — Attention QKᵀ ──────────────────────────────────────────────────
+    // Each (row_group, attn_col) pair → one 7-element vector.
+    // Advances: 49 cols × 7 groups × 3 heads = 1 029.
+    if (state == S_H_NEXT_ATTN_COL)
+        sb_advance = 1'b1;
+
+    // ── MHA — SxV ────────────────────────────────────────────────────────────
+    // Each (row_group, sxv_col) pair → one 7-element vector.
+    // Advances: 32 cols × 7 groups × 3 heads = 672.
+    if (state == S_H_NEXT_SXV_COL)
+        sb_advance = 1'b1;
+
+    // ── MHA — W_proj ─────────────────────────────────────────────────────────
+    // Each (row_group, proj_col) pair → one 7-element vector.
+    // Advances: 96 cols × 7 groups = 672.
+    if (state == S_H_PROJ_NEXT_COL)
+        sb_advance = 1'b1;
+
+    // ── MHA — FFN1 ───────────────────────────────────────────────────────────
+    // Each (row_group, ffn1_col) pair → one 7-element vector.
+    // Advances: 384 cols × 7 groups = 2 688.
+    if (state == S_H_FFN1_NEXT_COL)
+        sb_advance = 1'b1;
+
+    // ── MHA — FFN2 ───────────────────────────────────────────────────────────
+    // Each (row_group, ffn2_col) pair → one 7-element vector.
+    // Advances: 96 cols × 7 groups = 672.
+    if (state == S_H_FFN2_NEXT_COL)
+        sb_advance = 1'b1;
+
+end : shift_buf_ctrl

@@ -1,38 +1,74 @@
 // =============================================================================
-// weight_memory.sv
-// Unified Weight Memory — large on-chip SRAM holding ALL weight data.
+// weight_memory.sv  (rev 3 — SWIN Block round weight storage)
 //
-// ── Address Map (time-shared, only one mode active at a time) ─────────────
-//   Conv mode   : 96 kernels × 13 words/kernel = 1,248 words  [0 .. 1247]
-//                 Word k*13+p  → PE-p weights of kernel k  (p=0..11)
-//                 Word k*13+12 → bias of kernel k
+// ── Round boundary clarification ─────────────────────────────────────────
 //
-//   MLP  mode   : W1 (96×384, col-major)  + W2 (384×96, col-major)
-//                 W1: 384 cols × 24 words/col  = 9,216 words  [0 .. 9215]
-//                 W2:  96 cols × 96 words/col  = 9,216 words  [9216 .. 18431]
-//                 Total MLP weight words        = 18,432
+//   The accelerator has three operational modes (from paper):
 //
-//   Maximum depth = 18,432 words → AW = 15  (ceil log2 = 14.17, use 15)
+//   Mode 2'b00  PATCH EMBEDDING  — one full round by itself.
+//                                  Writes result to off-chip at end.
+//   Mode 2'b01  PATCH MERGING   — one full round by itself.
+//                                  Writes result to off-chip at end.
+//   Mode 2'b10  SWIN BLOCK      — ONE single round that executes BOTH:
+//                                  1) W-MSA / SW-MSA  + shortcut
+//                                  2) FFN  (W1 → GELU → W2) + shortcut
+//                                  Only MWU writes to off-chip at the
+//                                  END of the FFN, not between MSA and FFN.
+//
+//   Therefore weight_memory must hold ALL weights needed for the full SWIN
+//   Block round before it starts: W_Q, W_K, W_V, W_Proj, W_FFN1, W_FFN2.
+//
+// ── Address Map ──────────────────────────────────────────────────────────
+//
+//   ┌──────────────────────────────────────────────────────────────────────┐
+//   │ MODE 2'b00  Patch Embedding                                          │
+//   │   96 kernels × 13 words (12 PE weights + 1 bias) = 1,248 words      │
+//   │   [0 .. 1247]                                                        │
+//   ├──────────────────────────────────────────────────────────────────────┤
+//   │ MODE 2'b01  Patch Merging  (same layout as legacy MLP)               │
+//   │   W1: 384 cols × 24 w/col  = 9,216 words  [0 ..  9215]              │
+//   │   W2:  96 cols × 96 w/col  = 9,216 words  [9216 .. 18431]           │
+//   ├──────────────────────────────────────────────────────────────────────┤
+//   │ MODE 2'b10  SWIN Transformer Block (MSA + FFN — single round)        │
+//   │                                                                      │
+//   │   W_Q    (96×96, 24 w/col) : [     0 ..  2303]  2304 words          │
+//   │   W_K    (96×96, 24 w/col) : [  2304 ..  4607]  2304 words          │
+//   │   W_V    (96×96, 24 w/col) : [  4608 ..  6911]  2304 words          │
+//   │   W_Proj (96×96, 24 w/col) : [  6912 ..  9215]  2304 words          │
+//   │   W_FFN1 (384×96,96 w/col) : [  9216 .. 18431]  9216 words          │
+//   │   W_FFN2 (96×384,24 w/col) : [ 18432 .. 27647]  9216 words          │
+//   │                                                                      │
+//   │   Total SWIN Block words = 27,648                                    │
+//   └──────────────────────────────────────────────────────────────────────┘
+//
+//   Maximum depth = 27,648 words  →  AW = 15  (2^15 = 32768 ≥ 27648)
+//   (No AW change needed from rev 2; 15 bits already sufficient.)
+//
+// ── W_FFN2 column layout note ─────────────────────────────────────────────
+//   W_FFN2 maps 384 inputs → 96 outputs.
+//   Stored col-major: 96 output columns, each column has 384/4 = 96 words.
+//   Controller reads column c  →  base W_FFN2_BASE + c*96 + word_offset.
+//   This is the same word-per-column count as legacy W2 in MLP mode.
 //
 // ── Interface ────────────────────────────────────────────────────────────
 //   Single write port  : loaded by external DMA / CPU before engine start.
-//   Single read port   : driven by the DSU on behalf of the active controller.
+//   Single read port   : driven by the controller (unified_controller).
 //   Read latency       : 1 cycle (rd_data valid the cycle after rd_en).
 // =============================================================================
 
 module weight_memory #(
-    parameter DEPTH = 18432,    // words (covers MLP case; Conv uses only 1248)
-    parameter AW    = 15        // ceil(log2(18432)) = 15
+    parameter int DEPTH = 27648,   // words — covers full SWIN Block round
+    parameter int AW    = 15       // ceil(log2(27648)) = 15  (unchanged)
 )(
     input  logic          clk,
     input  logic          rst_n,
 
-    // ── Write port (CPU / DMA) ────────────────────────────────────────────
+    // ── Write port (CPU / DMA — loads all weights before engine start) ────
     input  logic [AW-1:0] wr_addr,
     input  logic [31:0]   wr_data,
     input  logic          wr_en,
 
-    // ── Read port (to DSU → controllers → weight buffers) ─────────────────
+    // ── Read port (to controller → weight buffers) ────────────────────────
     input  logic [AW-1:0] rd_addr,
     input  logic          rd_en,
     output logic [31:0]   rd_data
@@ -60,3 +96,26 @@ module weight_memory #(
     end
 
 endmodule
+
+// =============================================================================
+// Weight Base-Address Constants (for use in unified_controller)
+//
+// ── Patch Embedding (mode 2'b00) ──────────────────────────────────────────
+//   CONV_W_BASE   =     0   (96 kernels × 13 words each)
+//
+// ── Patch Merging (mode 2'b01) ────────────────────────────────────────────
+//   PM_W1_BASE    =     0   (384 cols × 24 w/col = 9216 words)
+//   PM_W2_BASE    =  9216   (96  cols × 96 w/col = 9216 words)
+//
+// ── SWIN Transformer Block (mode 2'b10) ──────────────────────────────────
+//   MSA_WQ_BASE   =     0   (96 cols × 24 w/col)
+//   MSA_WK_BASE   =  2304   (96 cols × 24 w/col)
+//   MSA_WV_BASE   =  4608   (96 cols × 24 w/col)
+//   MSA_WP_BASE   =  6912   (96 cols × 24 w/col)  [Proj]
+//   FFN_W1_BASE   =  9216   (96 cols × 96 w/col)  [expand 96→384]
+//   FFN_W2_BASE   = 18432   (384 cols × 24 w/col) [compress 384→96]
+//
+//   MSA_QKV_COL_WORDS = 24  (96 weights ÷ 4 B/word)
+//   FFN_W1_COL_WORDS  = 96  (384 weights ÷ 4 B/word)
+//   FFN_W2_COL_WORDS  = 24  (96 weights ÷ 4 B/word)  ← same as MSA
+// =============================================================================
