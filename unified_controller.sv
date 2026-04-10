@@ -1,164 +1,81 @@
 // =============================================================================
-// unified_controller.sv  (rev 3 — MHA / Swin Transformer Block support + Shift Buffer)
+// unified_controller.sv  (rev 4 — Mask Buffer integration)
 //
-// ── What changed from rev 2 ───────────────────────────────────────────────
-//   Added mode 2'b10 : Swin Transformer Block (MHA).
-//   The MHA round executes entirely on-chip in a single pass before the MWU
-//   returns results to off-chip memory.  This matches the paper description:
+// ── What changed from rev 3 ───────────────────────────────────────────────
+//   Added mask-apply sub-FSM that runs per attention head, immediately after
+//   the head's full 49×49 QK^T score matrix is stored in the ILB and before
+//   the S×V step begins.
 //
-//     "The accelerator is capable of executing the entire computation of
-//      the Swin Transformer Block in a single round, which includes
-//      SWMSA/WMSA, Shortcut Mechanism, and FFN."
+//   The mask_buffer module (external) holds 49 × 32-bit attention-bias values.
+//   Each bias is broadcast-added to every element of the corresponding 7×7
+//   sub-block of the 49×49 score matrix (49 sub-blocks × 49 elements each).
+//   The addition itself is performed by an adder in full_system_top:
+//       assign masked_s_word = omem_fb_rd_data + mask_data_out;
+//   This controller only orchestrates the read-modify-write loop and drives
+//   the two handshake signals into mask_buffer.
 //
-//   Within one MHA round (per 7×7 window, 64 windows total):
-//     Step 1:  Load input patch (49×96) from FIB → ibuf, load W_Q from wmem
-//              Compute Q = X × W_Q  (49×96)  → store in ILB (output_memory)
-//     Step 2:  Reload input patch from FIB, load W_K
-//              Compute K = X × W_K  (49×96)  → store in ILB
-//     Step 3:  Reload input patch from FIB, load W_V
-//              Compute V = X × W_V  (49×96)  → store in ILB
-//     Step 4:  For each head h in 0..2:
-//                Load Q_h (49×32) from ILB → ibuf
-//                Load K_h^T (32×49) from ILB → wbuf  (K transposed on read)
-//                Compute S_h = Q_h × K_h^T  (49×49)  → store in ILB
-//     Step 5:  For each head h in 0..2:
-//                Load S_h (49×49) from ILB → ibuf
-//                Load V_h (49×32) from ILB → wbuf
-//                Compute A_h = S_h × V_h  (49×32)   → store in ILB
-//     Step 6:  Concatenate A_0..A_2 → 49×96, apply W_proj linear transform
-//              Output of this step + Shortcut from FIB → ILB
-//     Step 7:  FFN Layer 1: 49×96 → 49×384, GELU activation, stored in ILB
-//     Step 8:  FFN Layer 2: 49×384 → 49×96, + Shortcut → MWU → off-chip
+// ── New ports ─────────────────────────────────────────────────────────────
+//   output qkt_store_done    : 1-cycle pulse when a head's 49×49 QK^T is done
+//   output mask_next_window  : 1-cycle pulse after each 49-element window R-M-W
+//   input  mask_valid        : from mask_buffer (mask pass active)
+//   input  mask_window_idx   : current sub-block index from mask_buffer
+//   input  mask_all_done     : from mask_buffer, last window finished
 //
-//   The controller issues mode-2 IDs for the MMU so it knows which op to run.
-//   The `mode` input is now 2 bits (was 1 bit).
+// ── New states (3) ────────────────────────────────────────────────────────
+//   S_H_MASK_RD       = 7'd83   issue ILB fb_rd_en for one score element
+//   S_H_MASK_WB       = 7'd84   fb_rd_data valid → write masked value back
+//   S_H_MASK_NEXT_WIN = 7'd85   pulse mask_next_window; loop or exit
 //
-// ── Weight memory layout (MHA additions) ─────────────────────────────────
-//   Existing:
-//     [0     ..  9215] : Conv kernels  (96 kernels × 13 words = 1248 words,
-//                          but WAW=15 → 32768 entries, so plenty of space)
-//     [W2_BASE .. ...]  : MLP W2
-//   New MHA weight offsets (all configurable as parameters):
-//     WQ_BASE  : W_Q  96×96  = 9216  words (at 4 bytes/word = 36864 B each)
-//     WK_BASE  : W_K  96×96  = 9216  words
-//     WV_BASE  : W_V  96×96  = 9216  words
-//     WPROJ_BASE: W_proj 96×96 = 9216 words
-//     WFFN1_BASE: W_FFN1 96×384= 36864 words (96×384=36864, /4 words = 9216)
-//     WFFN2_BASE: W_FFN2 384×96= 36864 words
-//   Total MHA weight words: 6 × 9216 = 55,296 words → needs WAW ≥ 16 (65536)
-//   → WAW bumped to 16 in parameter declaration (was 15).
+// ── State transition change ───────────────────────────────────────────────
+//   S_H_NEXT_ATTN_ROWGRP: h_last_attn_rowgrp now → S_H_MASK_RD (was S_H_NEXT_ATTN_HD)
+//   S_H_MASK_NEXT_WIN:    mask_all_done           → S_H_NEXT_ATTN_HD
 //
-// ── FIB / ILB memory layout (MHA) ─────────────────────────────────────────
-//   FIB: holds full 56×56×96 feature map (75,264 words) — unchanged.
-//   ILB (output_memory): intermediate results written/read during MHA round.
-//     Q/K/V per head:  3 heads × 49×32 = 4,704 bytes each set
-//     QKᵀ attention:   3 heads × 49×49 = 7,203 bytes
-//     SxV (MHA out):   3 heads × 49×32 = 4,704 bytes
-//     After W_proj:    49×96 = 4,704 bytes
-//     FFN intermediates (GELU): 49×384 = 18,816 bytes
-//   Peak ILB demand ≈ 50 KB — fits comfortably in OAW=19 (512K word space).
+// ── New counter ───────────────────────────────────────────────────────────
+//   h_mask_elem_cnt [5:0] : element index within the current 7×7 sub-block (0..48)
 //
-// ── State encoding (48 states, 6-bit) ────────────────────────────────────
-//   [0..27]   : unchanged from rev 2 (Conv and MLP)
-//   [28..47]  : new MHA states
-//
-//   MHA states:
-//   S_H_LOAD_INPUT   = 28   load 49-patch window from FIB into ibuf
-//   S_H_SWAP_INPUT   = 29
-//   S_H_LOAD_WQ      = 30   load W_Q column from wmem into wbuf
-//   S_H_SWAP_WQ      = 31
-//   S_H_COMPUTE_Q    = 32   compute Q column (49×1 partial, 8 sub-cycles)
-//   S_H_NEXT_QKV_COL = 33   advance to next output column (0..95)
-//   S_H_NEXT_QKV_MAT = 34   advance matrix (Q done → K, K done → V)
-//   S_H_LOAD_WKT     = 35   load K^T row (as weight column) for attention
-//   S_H_SWAP_WKT     = 36
-//   S_H_LOAD_QH      = 37   load Q head from ILB into ibuf
-//   S_H_SWAP_QH      = 38
-//   S_H_COMPUTE_ATTN = 39   compute S = QKᵀ column
-//   S_H_NEXT_ATTN_COL= 40
-//   S_H_NEXT_ATTN_HD = 41   advance head (0..2)
-//   S_H_LOAD_SH      = 42   load S head from ILB into ibuf for SxV
-//   S_H_SWAP_SH      = 43
-//   S_H_LOAD_VH      = 44   load V head column into wbuf
-//   S_H_SWAP_VH      = 45
-//   S_H_COMPUTE_SXV  = 46   compute A = SxV column
-//   S_H_NEXT_SXV_COL = 47
-//   S_H_NEXT_SXV_HD  = 48
-//   S_H_PROJ_LOAD_W  = 49   load W_proj column
-//   S_H_PROJ_SWAP_W  = 50
-//   S_H_PROJ_COMPUTE = 51   compute A_concat × W_proj column
-//   S_H_PROJ_NEXT_COL= 52
-//   S_H_SHORTCUT1    = 53   add shortcut (ILB + FIB) → ILB  [ctrl signal only]
-//   S_H_FFN1_LOAD_W  = 54   load W_FFN1 column (96→384 expansion)
-//   S_H_FFN1_SWAP_W  = 55
-//   S_H_FFN1_COMPUTE = 56
-//   S_H_FFN1_NEXT_COL= 57
-//   S_H_GELU_WAIT    = 58   GCU pipeline drain (GELU on 49×384)
-//   S_H_FFN2_LOAD_W  = 59   load W_FFN2 column (384→96 contraction)
-//   S_H_FFN2_SWAP_W  = 60
-//   S_H_LOAD_FFN1_OUT= 61   reload FFN1 output from ILB into ibuf
-//   S_H_SWAP_FFN1_OUT= 62
-//   S_H_FFN2_COMPUTE = 63
-//   S_H_FFN2_NEXT_COL= 64
-//   S_H_SHORTCUT2    = 65   add shortcut (FFN2 out + attn out)
-//   S_H_WRITEBACK    = 66   write FFN2 result via MWU to off-chip
-//   S_H_NEXT_WINDOW  = 67   advance to next of 64 windows
+// ── Mask pass cost per window ─────────────────────────────────────────────
+//   49 sub-blocks × 49 elements × 2 cycles (RD+WB) = 4 802 cycles/head
+//   × 3 heads = 14 406 cycles per 7×7 window (added after QK^T, before S×V)
 // =============================================================================
 
 module unified_controller #(
-    parameter int WAW      = 16,    // weight_memory address width (was 15, bumped for MHA)
-    parameter int FAW      = 17,    // fib_memory address width
-    parameter int OAW      = 19,    // output_memory address width
-    parameter int W2_BASE  = 9216,  // MLP W2 block offset in weight_memory
+    parameter int WAW      = 16,
+    parameter int FAW      = 17,
+    parameter int OAW      = 19,
+    parameter int W2_BASE  = 9216,
 
-    // MHA weight offsets (in 32-bit words)
-    parameter int WQ_BASE   = 10240,   // 96×96   = 9216 words  (after MLP weights)
-    parameter int WK_BASE   = 19456,   // WQ_BASE + 9216
-    parameter int WV_BASE   = 28672,   // WK_BASE + 9216
-    parameter int WPROJ_BASE= 37888,   // WV_BASE + 9216
-    parameter int WFFN1_BASE= 47104,   // WPROJ_BASE + 9216  (96×384 packed into 9216 words)
-    parameter int WFFN2_BASE= 56320,   // WFFN1_BASE + 9216  (384×96 packed into 9216 words)
+    // MHA weight offsets
+    parameter int WQ_BASE    = 10240,
+    parameter int WK_BASE    = 19456,
+    parameter int WV_BASE    = 28672,
+    parameter int WPROJ_BASE = 37888,
+    parameter int WFFN1_BASE = 47104,
+    parameter int WFFN2_BASE = 56320,
 
-    // MHA ILB base addresses (in output_memory word space)
-    // Layout: Q[0..3071], K[3072..6143], V[6144..9215],
-    //         S[9216..16467 = 3×49×49], A[16468..19539 = 3×49×32],
-    //         PROJ[19540..20587 = 49×96/4], FFN1[20588..25291 = 49×384/4]
+    // MHA ILB base addresses
     parameter int ILB_Q_BASE    = 0,
-    parameter int ILB_K_BASE    = 3072,   // 3×49×32/4
+    parameter int ILB_K_BASE    = 3072,
     parameter int ILB_V_BASE    = 6144,
-    parameter int ILB_S_BASE    = 9216,   // attention scores 3×49×49
-    parameter int ILB_A_BASE    = 16468,  // SxV output 3×49×32
-    parameter int ILB_PROJ_BASE = 19540,  // W_proj output 49×96
-    parameter int ILB_FFN1_BASE = 20588,  // FFN1 output 49×384
+    parameter int ILB_S_BASE    = 9216,
+    parameter int ILB_A_BASE    = 16468,
+    parameter int ILB_PROJ_BASE = 19540,
+    parameter int ILB_FFN1_BASE = 20588,
 
-    // ── Shift buffer parameters ──────────────────────────────────────────────
-    // These must match the DEPTH and layout in shift_buffer.sv / full_system_top.sv.
-    // Entry counts per operation:
-    //   Conv : 96 kernels × 56 output rows            = 5 376 entries  [0 .. 5375]
-    //   MLP  : 448 row-groups (3136 rows / 7)         =   448 entries  [5376 .. 5823]
-    //          (same 448-entry table reused by L1 and L2 within one MLP pass)
-    //   MHA  : all sub-ops per 7×7 window              = 7 749 entries  [5824 .. 13572]
-    //          Layout within MHA window (sequential):
-    //            QKV   : 96 cols × 7 groups × 3 mats  = 2 016
-    //            ATTN  : 49 cols × 7 groups × 3 heads = 1 029
-    //            SxV   : 32 cols × 7 groups × 3 heads =   672
-    //            PROJ  : 96 cols × 7 groups           =   672
-    //            FFN1  : 384 cols × 7 groups          = 2 688
-    //            FFN2  : 96 cols × 7 groups           =   672
-    parameter int SB_AW         = 14,    // must match shift_buffer AW = log2(DEPTH)
-    parameter int SB_CONV_BASE  = 0,     // entry base for Conv shift table
-    parameter int SB_MLP_BASE   = 5376,  // entry base for MLP shift table
-    parameter int SB_MHA_BASE   = 5824   // entry base for MHA shift table (per window)
+    // Shift buffer parameters
+    parameter int SB_AW        = 14,
+    parameter int SB_CONV_BASE = 0,
+    parameter int SB_MLP_BASE  = 5376,
+    parameter int SB_MHA_BASE  = 5824
 )(
     input  logic clk,
     input  logic rst_n,
 
     // ── Mode and start/done ───────────────────────────────────────────────
-    input  logic [1:0] mode,   // 2'b00=Conv, 2'b01=MLP, 2'b10=MHA
+    input  logic [1:0] mode,
     input  logic start,
     output logic done,
 
-    // ── Weight memory — active bank read  ────────────────────────────────
+    // ── Weight memory — active bank read ─────────────────────────────────
     output logic [WAW-1:0] wmem_rd_addr,
     output logic           wmem_rd_en,
     input  logic [31:0]    wmem_rd_data,
@@ -170,11 +87,11 @@ module unified_controller #(
     // ── Weight memory — bank swap ─────────────────────────────────────────
     output logic           wmem_swap,
 
-    // ── External big memory (weight source, 1-cycle latency) ─────────────
+    // ── External big memory ───────────────────────────────────────────────
     output logic [WAW-1:0] ext_weight_rd_addr,
     output logic           ext_weight_rd_en,
 
-    // ── Input / feature memory (fib or omem.fb, muxed in top) ────────────
+    // ── Input / feature memory ────────────────────────────────────────────
     output logic [OAW-1:0] imem_rd_addr,
     output logic           imem_rd_en,
     input  logic [31:0]    imem_rd_data,
@@ -194,10 +111,10 @@ module unified_controller #(
 
     // ── Input buffer control ──────────────────────────────────────────────
     output logic           ibuf_load_en,
-    output logic [3:0]     ibuf_load_pe_idx,    // conv
-    output logic [2:0]     ibuf_load_win_idx,   // conv
-    output logic [2:0]     ibuf_load_row,       // mlp
-    output logic [6:0]     ibuf_load_k_word,    // mlp
+    output logic [3:0]     ibuf_load_pe_idx,
+    output logic [2:0]     ibuf_load_win_idx,
+    output logic [2:0]     ibuf_load_row,
+    output logic [6:0]     ibuf_load_k_word,
     output logic [31:0]    ibuf_load_data,
     output logic           ibuf_swap,
     output logic           ibuf_l1_capture_en,
@@ -221,25 +138,37 @@ module unified_controller #(
     output logic [2:0]     obuf_rd_idx,
 
     // ── Feedback path select ──────────────────────────────────────────────
-    // Tells full_system_top to route imem reads from ILB (output_memory)
-    // instead of FIB during MHA intermediate steps.
     output logic           omem_fb_en_ctrl,
 
-    // ── Shift buffer control ──────────────────────────────────────────────────
-    // sb_op_start     : one-cycle pulse when a new operation begins (or each new
-    //                   MHA window).  Carries the entry base address that the
-    //                   shift_buffer will reset its read pointer to.
-    // sb_op_base_addr : entry address of the first shift value for this op.
-    // sb_advance      : one-cycle pulse after every completed 7-element row-group
-    //                   writeback, causing the shift_buffer to step to the next
-    //                   shift value for the following row-group.
+    // ── Shift buffer control ──────────────────────────────────────────────
     output logic               sb_op_start,
     output logic [SB_AW-1:0]   sb_op_base_addr,
-    output logic               sb_advance
+    output logic               sb_advance,
+
+    // ── Mask buffer control (NEW) ─────────────────────────────────────────
+    // qkt_store_done:   1-cycle pulse when a head's full 49×49 QK^T score
+    //                   matrix has just been written to the ILB.  Resets the
+    //                   mask_buffer read pointer and starts the mask pass.
+    // mask_next_window: 1-cycle pulse after all 49 elements of the current
+    //                   7×7 sub-block have been read-modify-written.
+    //                   Advances mask_buffer.rd_ptr by one.
+    output logic           qkt_store_done,
+    output logic           mask_next_window,
+
+    // mask_valid:       Driven by mask_buffer; 1 during an active mask pass.
+    //                   The controller may use this as a sanity check.
+    // mask_window_idx:  Current sub-block index (0..48) from mask_buffer.
+    //                   Used to compute ILB addresses during the mask states.
+    // mask_all_done:    1-cycle pulse from mask_buffer on the last
+    //                   mask_next_window (window 48).  Used in
+    //                   S_H_MASK_NEXT_WIN to decide whether to loop or exit.
+    input  logic           mask_valid,
+    input  logic [5:0]     mask_window_idx,
+    input  logic           mask_all_done
 );
 
 // =============================================================================
-// Parameters — Conv and MLP (unchanged)
+// Parameters — Conv / MLP (unchanged)
 // =============================================================================
 localparam int C_N_KERNELS     = 96;
 localparam int C_N_ROW_GROUPS  = 56;
@@ -254,71 +183,58 @@ localparam int C_IMG_CH_WORDS  = 56 * 224;
 localparam int C_OUT_ROW_WORDS = 56;
 localparam int C_OUT_K_WORDS   = 56 * 56;
 
-localparam int M_N_ROW_GRPS    = 448;
-localparam int M_N_L1_COLS     = 384;
-localparam int M_N_L2_COLS     = 96;
-localparam int M_N_ACC_L1      = 2;
-localparam int M_N_ACC_L2      = 8;
-localparam int M_W1_WORDS      = 24;
-localparam int M_W2_WORDS      = 96;
-localparam int M_X_WORDS       = 168;
-localparam int M_W1_CYCS       = M_W1_WORDS * 2;
-localparam int M_W2_CYCS       = M_W2_WORDS * 2;
-localparam int M_X_CYCS        = M_X_WORDS  * 2;
-localparam int M_OUT_WORDS     = 7;
+localparam int M_N_ROW_GRPS = 448;
+localparam int M_N_L1_COLS  = 384;
+localparam int M_N_L2_COLS  = 96;
+localparam int M_N_ACC_L1   = 2;
+localparam int M_N_ACC_L2   = 8;
+localparam int M_W1_WORDS   = 24;
+localparam int M_W2_WORDS   = 96;
+localparam int M_X_WORDS    = 168;
+localparam int M_W1_CYCS    = M_W1_WORDS * 2;
+localparam int M_W2_CYCS    = M_W2_WORDS * 2;
+localparam int M_X_CYCS     = M_X_WORDS  * 2;
+localparam int M_OUT_WORDS  = 7;
 
 // =============================================================================
-// Parameters — MHA
+// Parameters — MHA (unchanged except two new mask localparams)
 // =============================================================================
-// Each 7×7 window: 49 patches × 96 features
-localparam int H_N_WINDOWS     = 64;    // total windows in 56×56 image
-localparam int H_N_PATCHES     = 49;    // patches per window
-localparam int H_N_HEADS       = 3;
-localparam int H_HEAD_DIM      = 32;    // features per head (96/3)
-localparam int H_C_IN          = 96;    // input channels
-localparam int H_C_FFN         = 384;   // FFN expansion (×4)
+localparam int H_N_WINDOWS  = 64;
+localparam int H_N_PATCHES  = 49;
+localparam int H_N_HEADS    = 3;
+localparam int H_HEAD_DIM   = 32;
+localparam int H_C_IN       = 96;
+localparam int H_C_FFN      = 384;
 
-// Words to load a 96-column weight vector (12 PEs × 4 taps = 48 features
-// → 96/48 = 2 sub-cycles, each word = 4 bytes → 96/4 = 24 words/column)
-localparam int H_W_QKV_WORDS   = 24;    // words per column of W_Q/K/V (96 rows / 4)
-localparam int H_W_QKV_CYCS    = H_W_QKV_WORDS * 2;   // 48
+localparam int H_W_QKV_WORDS  = 24;
+localparam int H_W_QKV_CYCS   = H_W_QKV_WORDS * 2;
+localparam int H_WKT_WORDS    = 13;
+localparam int H_WKT_CYCS     = H_WKT_WORDS * 2;
+localparam int H_I_PATCH7_WORDS = H_N_PATCHES * H_W_QKV_WORDS;
+localparam int H_I_LOAD7_WORDS  = 7 * H_W_QKV_WORDS;
+localparam int H_I_LOAD7_CYCS   = H_I_LOAD7_WORDS * 2;
+localparam int H_QH_LOAD_WORDS  = 7 * 8;
+localparam int H_QH_LOAD_CYCS   = H_QH_LOAD_WORDS * 2;
 
-// QKᵀ: K^T has 32 rows (head_dim), 12 PEs × 4 taps = 48, so ≤ 1 sub-cycle
-// K column (= row of K^T) is 49 elements; each word = 4 elements → 13 words
-localparam int H_WKT_WORDS     = 13;    // ceil(49/4)
-localparam int H_WKT_CYCS      = H_WKT_WORDS * 2;     // 26
+localparam int H_N_ACC_QKV  = 2;
+localparam int H_N_ACC_ATTN = 1;
+localparam int H_N_ACC_SXV  = 2;
+localparam int H_N_ACC_PROJ = 2;
+localparam int H_N_ACC_FFN1 = 2;
+localparam int H_N_ACC_FFN2 = 8;
+localparam int H_OUT_WORDS  = 7;
 
-// Input load for QKV step: 7 patches × 24 words = 168 words
-localparam int H_I_PATCH7_WORDS = H_N_PATCHES * H_W_QKV_WORDS;  // 49*24 = 1176 (full window)
-// We load 7 patches at a time (one ibuf bank row group = 7)
-localparam int H_I_LOAD7_WORDS  = 7 * H_W_QKV_WORDS;            // 7*24 = 168
-localparam int H_I_LOAD7_CYCS   = H_I_LOAD7_WORDS * 2;          // 336
-
-// For QKᵀ step: Q head (49×32) loaded 7 rows at a time; 32/4 = 8 words/row
-localparam int H_QH_LOAD_WORDS  = 7 * 8;                         // 56
-localparam int H_QH_LOAD_CYCS   = H_QH_LOAD_WORDS * 2;          // 112
-
-// Compute sub-cycles:
-// QKV: 96 input features / (12 PE × 4 taps) = 2 sub-cycles per 7-row group
-localparam int H_N_ACC_QKV      = 2;
-// QKᵀ: 32 features / 48 = 1 sub-cycle (only 32/4=8 PEs active)
-localparam int H_N_ACC_ATTN     = 1;
-// SxV: 49 features / 48 → 2 sub-cycles (need 49 partial sums)
-localparam int H_N_ACC_SXV      = 2;
-// Proj: same as QKV (96→96)
-localparam int H_N_ACC_PROJ     = 2;
-// FFN1: 96→384, weight col is 96 rows → same as QKV
-localparam int H_N_ACC_FFN1     = 2;
-// FFN2: 384→96, weight col is 384 rows → 384/48 = 8 sub-cycles
-localparam int H_N_ACC_FFN2     = 8;
-
-localparam int H_OUT_WORDS      = 7;
+// ── NEW: mask-related strides ─────────────────────────────────────────────
+// H_S_ELEMS       : total elements in one head's 49×49 score matrix
+// H_MASK_WIN_ELEMS: elements per 7×7 sub-block (= 49)
+localparam int H_S_ELEMS        = H_N_PATCHES * H_N_PATCHES; // 2401
+localparam int H_MASK_WIN_ELEMS = H_N_PATCHES;               // 49
 
 // =============================================================================
 // State encoding
 // =============================================================================
 typedef enum logic [6:0] {
-    // ── Conv (unchanged) ───────────────────────────────────────────────────
+    // ── Conv ──────────────────────────────────────────────────────────────
     S_IDLE              = 7'd0,
     S_C_INIT_PRELOAD    = 7'd1,
     S_C_INIT_WMEM_SWAP  = 7'd2,
@@ -330,7 +246,7 @@ typedef enum logic [6:0] {
     S_C_WAIT_OUT        = 7'd8,
     S_C_WRITEBACK       = 7'd9,
     S_C_NEXT            = 7'd10,
-    // ── MLP (unchanged) ───────────────────────────────────────────────────
+    // ── MLP ───────────────────────────────────────────────────────────────
     S_M_L1_PRELOAD0     = 7'd11,
     S_M_L1_WMEM_SWAP0   = 7'd12,
     S_M_L1_LOAD_X       = 7'd13,
@@ -348,39 +264,38 @@ typedef enum logic [6:0] {
     S_M_L2_NEXT_COL     = 7'd25,
     S_M_NEXT_ROW        = 7'd26,
     S_DONE              = 7'd27,
-    // ── MHA (new) ─────────────────────────────────────────────────────────
-    // QKV projection sub-FSM
-    S_H_LOAD_INPUT      = 7'd28,  // load 7 patches from FIB → ibuf
+    // ── MHA — QKV projection ──────────────────────────────────────────────
+    S_H_LOAD_INPUT      = 7'd28,
     S_H_SWAP_INPUT      = 7'd29,
-    S_H_LOAD_WQKV       = 7'd30,  // load W_Q/K/V column from wmem → wbuf
+    S_H_LOAD_WQKV       = 7'd30,
     S_H_SWAP_WQKV       = 7'd31,
-    S_H_COMPUTE_QKV     = 7'd32,  // compute one output column (7 rows)
-    S_H_WRITEBACK_QKV   = 7'd33,  // write 7-row result to ILB
-    S_H_NEXT_QKV_COL    = 7'd34,  // advance column (0..95)
-    S_H_NEXT_PATCH_GRP  = 7'd35,  // advance 7-patch group (0..6 → 0..48)
-    S_H_NEXT_QKV_MAT    = 7'd36,  // advance Q→K→V
-    // Attention score QKᵀ sub-FSM
-    S_H_LOAD_QH         = 7'd37,  // load Q head (7 rows × 8 words) from ILB
+    S_H_COMPUTE_QKV     = 7'd32,
+    S_H_WRITEBACK_QKV   = 7'd33,
+    S_H_NEXT_QKV_COL    = 7'd34,
+    S_H_NEXT_PATCH_GRP  = 7'd35,
+    S_H_NEXT_QKV_MAT    = 7'd36,
+    // ── MHA — Attention QKᵀ ───────────────────────────────────────────────
+    S_H_LOAD_QH         = 7'd37,
     S_H_SWAP_QH         = 7'd38,
-    S_H_LOAD_WKT        = 7'd39,  // load K^T column (=K row) from ILB → wbuf
+    S_H_LOAD_WKT        = 7'd39,
     S_H_SWAP_WKT        = 7'd40,
     S_H_COMPUTE_ATTN    = 7'd41,
     S_H_WRITEBACK_ATTN  = 7'd42,
     S_H_NEXT_ATTN_COL   = 7'd43,
     S_H_NEXT_ATTN_ROWGRP= 7'd44,
     S_H_NEXT_ATTN_HD    = 7'd45,
-    // SxV sub-FSM
-    S_H_LOAD_SH         = 7'd46,  // load S head row-group from ILB
+    // ── MHA — SxV ─────────────────────────────────────────────────────────
+    S_H_LOAD_SH         = 7'd46,
     S_H_SWAP_SH         = 7'd47,
-    S_H_LOAD_VH         = 7'd48,  // load V head column from ILB → wbuf
+    S_H_LOAD_VH         = 7'd48,
     S_H_SWAP_VH         = 7'd49,
     S_H_COMPUTE_SXV     = 7'd50,
     S_H_WRITEBACK_SXV   = 7'd51,
     S_H_NEXT_SXV_COL    = 7'd52,
     S_H_NEXT_SXV_ROWGRP = 7'd53,
     S_H_NEXT_SXV_HD     = 7'd54,
-    // W_proj linear transform
-    S_H_PROJ_LOAD_INPUT = 7'd55,  // load concat A from ILB into ibuf
+    // ── MHA — W_proj ──────────────────────────────────────────────────────
+    S_H_PROJ_LOAD_INPUT = 7'd55,
     S_H_PROJ_SWAP_INPUT = 7'd56,
     S_H_PROJ_LOAD_W     = 7'd57,
     S_H_PROJ_SWAP_W     = 7'd58,
@@ -388,8 +303,8 @@ typedef enum logic [6:0] {
     S_H_PROJ_WRITEBACK  = 7'd60,
     S_H_PROJ_NEXT_COL   = 7'd61,
     S_H_PROJ_NEXT_ROWGRP= 7'd62,
-    S_H_SHORTCUT1       = 7'd63,  // shortcut: proj_out + X_input
-    // FFN Layer 1 (96→384)
+    S_H_SHORTCUT1       = 7'd63,
+    // ── MHA — FFN1 ────────────────────────────────────────────────────────
     S_H_FFN1_LOAD_INPUT = 7'd64,
     S_H_FFN1_SWAP_INPUT = 7'd65,
     S_H_FFN1_LOAD_W     = 7'd66,
@@ -399,7 +314,7 @@ typedef enum logic [6:0] {
     S_H_FFN1_NEXT_COL   = 7'd70,
     S_H_FFN1_NEXT_ROWGRP= 7'd71,
     S_H_GELU_WAIT       = 7'd72,
-    // FFN Layer 2 (384→96)
+    // ── MHA — FFN2 ────────────────────────────────────────────────────────
     S_H_FFN2_LOAD_INPUT = 7'd73,
     S_H_FFN2_SWAP_INPUT = 7'd74,
     S_H_FFN2_LOAD_W     = 7'd75,
@@ -408,8 +323,29 @@ typedef enum logic [6:0] {
     S_H_FFN2_WRITEBACK  = 7'd78,
     S_H_FFN2_NEXT_COL   = 7'd79,
     S_H_FFN2_NEXT_ROWGRP= 7'd80,
-    S_H_SHORTCUT2       = 7'd81,  // shortcut: FFN2_out + shortcut1_out
-    S_H_NEXT_WINDOW     = 7'd82   // advance window index (0..63)
+    S_H_SHORTCUT2       = 7'd81,
+    S_H_NEXT_WINDOW     = 7'd82,
+    // ── MHA — Mask apply (NEW) ────────────────────────────────────────────
+    // These three states execute per attention head, between QK^T completion
+    // and S_H_NEXT_ATTN_HD, applying the attention bias mask in-place.
+    //
+    //  S_H_MASK_RD:
+    //      Assert fb_rd_en + fb_rd_addr for one ILB score element.
+    //      (1-cycle state; memory has 1-cycle latency so data appears next.)
+    //
+    //  S_H_MASK_WB:
+    //      fb_rd_data is valid.  Assert omem_wr_en + omem_wr_addr to write
+    //      back (fb_rd_data + mask_data_out), formed in full_system_top.
+    //      Increment h_mask_elem_cnt.
+    //      If last element of window → S_H_MASK_NEXT_WIN, else → S_H_MASK_RD.
+    //
+    //  S_H_MASK_NEXT_WIN:
+    //      Pulse mask_next_window for one cycle (advances mask_buffer.rd_ptr).
+    //      Reset h_mask_elem_cnt.
+    //      If mask_all_done → S_H_NEXT_ATTN_HD, else → S_H_MASK_RD.
+    S_H_MASK_RD        = 7'd83,
+    S_H_MASK_WB        = 7'd84,
+    S_H_MASK_NEXT_WIN  = 7'd85
 } state_t;
 
 state_t state, next_state;
@@ -432,23 +368,26 @@ logic [3:0] m_compute_cnt;
 logic [2:0] m_wb_cnt;
 
 // MHA
-logic [5:0]  h_win_idx;          // 0..63 windows
-logic [1:0]  h_qkv_mat;          // 0=Q, 1=K, 2=V
-logic [6:0]  h_qkv_col_idx;      // 0..95 output columns
-logic [2:0]  h_patch_grp;        // 0..6  (7 groups × 7 patches = 49)
-logic [1:0]  h_head_idx;         // 0..2
-logic [5:0]  h_attn_col_idx;     // 0..48 (QKᵀ columns = 49)
-logic [2:0]  h_attn_rowgrp;      // 0..6
-logic [4:0]  h_sxv_col_idx;      // 0..31 (SxV output columns per head)
-logic [2:0]  h_sxv_rowgrp;       // 0..6
-logic [6:0]  h_proj_col_idx;     // 0..95
+logic [5:0]  h_win_idx;
+logic [1:0]  h_qkv_mat;
+logic [6:0]  h_qkv_col_idx;
+logic [2:0]  h_patch_grp;
+logic [1:0]  h_head_idx;
+logic [5:0]  h_attn_col_idx;
+logic [2:0]  h_attn_rowgrp;
+logic [4:0]  h_sxv_col_idx;
+logic [2:0]  h_sxv_rowgrp;
+logic [6:0]  h_proj_col_idx;
 logic [2:0]  h_proj_rowgrp;
-logic [8:0]  h_ffn1_col_idx;     // 0..383
+logic [8:0]  h_ffn1_col_idx;
 logic [2:0]  h_ffn1_rowgrp;
-logic [6:0]  h_ffn2_col_idx;     // 0..95
+logic [6:0]  h_ffn2_col_idx;
 logic [2:0]  h_ffn2_rowgrp;
 logic [2:0]  h_compute_cnt;
 logic [2:0]  h_wb_cnt;
+
+// NEW: element index within current mask sub-block (0..48)
+logic [5:0]  h_mask_elem_cnt;
 
 // Shared load cycle
 logic [9:0] load_cyc;
@@ -461,9 +400,9 @@ assign load_cnt   = load_cyc[9:1];
 // Last-element flags — Conv / MLP
 // =============================================================================
 logic c_last_chunk, c_last_row_group, c_last_kernel;
-assign c_last_chunk     = (c_chunk_idx      == C_N_CHUNKS      - 1);
-assign c_last_row_group = (c_row_group_idx == C_N_ROW_GROUPS - 1);
-assign c_last_kernel    = (c_kernel_idx    == C_N_KERNELS    - 1);
+assign c_last_chunk     = (c_chunk_idx     == C_N_CHUNKS      - 1);
+assign c_last_row_group = (c_row_group_idx == C_N_ROW_GROUPS  - 1);
+assign c_last_kernel    = (c_kernel_idx    == C_N_KERNELS      - 1);
 
 logic m_last_row_grp, m_last_l1_col, m_last_l2_col, m_last_wb;
 assign m_last_row_grp = (m_row_grp_idx == M_N_ROW_GRPS - 1);
@@ -480,21 +419,25 @@ logic h_last_sxv_col, h_last_sxv_rowgrp;
 logic h_last_proj_col, h_last_proj_rowgrp;
 logic h_last_ffn1_col, h_last_ffn1_rowgrp;
 logic h_last_ffn2_col, h_last_ffn2_rowgrp;
+// NEW
+logic h_last_mask_elem;
 
-assign h_last_win        = (h_win_idx        == H_N_WINDOWS  - 1);
-assign h_last_qkv_col    = (h_qkv_col_idx    == H_C_IN       - 1);  // 95
-assign h_last_patch_grp  = (h_patch_grp      == (H_N_PATCHES / 7)); // 6  (7 groups)
-assign h_last_head       = (h_head_idx       == H_N_HEADS    - 1);  // 2
-assign h_last_attn_col   = (h_attn_col_idx  == H_N_PATCHES  - 1);  // 48
-assign h_last_attn_rowgrp= (h_attn_rowgrp   == (H_N_PATCHES / 7)); // 6
-assign h_last_sxv_col    = (h_sxv_col_idx    == H_HEAD_DIM   - 1);  // 31
-assign h_last_sxv_rowgrp = (h_sxv_rowgrp     == (H_N_PATCHES / 7));
-assign h_last_proj_col   = (h_proj_col_idx  == H_C_IN       - 1);
-assign h_last_proj_rowgrp= (h_proj_rowgrp   == (H_N_PATCHES / 7));
-assign h_last_ffn1_col   = (h_ffn1_col_idx  == H_C_FFN      - 1);  // 383
-assign h_last_ffn1_rowgrp= (h_ffn1_rowgrp   == (H_N_PATCHES / 7));
-assign h_last_ffn2_col   = (h_ffn2_col_idx  == H_C_IN       - 1);
-assign h_last_ffn2_rowgrp= (h_ffn2_rowgrp   == (H_N_PATCHES / 7));
+assign h_last_win         = (h_win_idx       == H_N_WINDOWS  - 1);
+assign h_last_qkv_col     = (h_qkv_col_idx   == H_C_IN       - 1);
+assign h_last_patch_grp   = (h_patch_grp     == (H_N_PATCHES / 7));
+assign h_last_head        = (h_head_idx      == H_N_HEADS    - 1);
+assign h_last_attn_col    = (h_attn_col_idx  == H_N_PATCHES  - 1);
+assign h_last_attn_rowgrp = (h_attn_rowgrp   == (H_N_PATCHES / 7));
+assign h_last_sxv_col     = (h_sxv_col_idx   == H_HEAD_DIM   - 1);
+assign h_last_sxv_rowgrp  = (h_sxv_rowgrp    == (H_N_PATCHES / 7));
+assign h_last_proj_col    = (h_proj_col_idx  == H_C_IN       - 1);
+assign h_last_proj_rowgrp = (h_proj_rowgrp   == (H_N_PATCHES / 7));
+assign h_last_ffn1_col    = (h_ffn1_col_idx  == H_C_FFN      - 1);
+assign h_last_ffn1_rowgrp = (h_ffn1_rowgrp   == (H_N_PATCHES / 7));
+assign h_last_ffn2_col    = (h_ffn2_col_idx  == H_C_IN       - 1);
+assign h_last_ffn2_rowgrp = (h_ffn2_rowgrp   == (H_N_PATCHES / 7));
+// NEW: true when h_mask_elem_cnt points at the last element of a sub-block
+assign h_last_mask_elem   = (h_mask_elem_cnt == 6'(H_MASK_WIN_ELEMS - 1));
 
 // =============================================================================
 // Address generation — Conv / MLP (unchanged)
@@ -559,12 +502,9 @@ assign m_shadow_w2_next_addr = WAW'(W2_BASE)
                              + WAW'(load_cnt);
 
 // =============================================================================
-// Address generation — MHA
+// Address generation — MHA (unchanged except new mask block below)
 // =============================================================================
 
-// ── QKV weight addresses ──────────────────────────────────────────────────
-// Each of W_Q, W_K, W_V is 96×96, stored column-major.
-// Column h_qkv_col_idx has 96/4=24 words.
 function automatic logic [WAW-1:0] qkv_base(input logic [1:0] mat);
     case (mat)
         2'd0: return WAW'(WQ_BASE);
@@ -576,26 +516,18 @@ endfunction
 
 logic [WAW-1:0] h_wqkv_rd_addr;
 assign h_wqkv_rd_addr = qkv_base(h_qkv_mat)
-                        + WAW'(h_qkv_col_idx) * H_W_QKV_WORDS
-                        + WAW'(load_cnt);
+                      + WAW'(h_qkv_col_idx) * H_W_QKV_WORDS
+                      + WAW'(load_cnt);
 
-// ── FIB input load address for QKV (window patches) ──────────────────────
-// Window h_win_idx starts at patch h_win_idx*49 in the FIB.
-// Group h_patch_grp: patches [h_patch_grp*7 .. h_patch_grp*7+6]
-// Word index load_cnt = patch_in_grp * 24 + k_word
 logic [FAW-1:0] h_fib_patch_addr;
 always_comb begin
-    automatic int global_patch = int'(h_win_idx) * H_N_PATCHES
-                                + int'(h_patch_grp) * 7
-                                + int'(load_cnt) / 24;
+    automatic int global_patch = int'(h_win_idx)   * H_N_PATCHES
+                               + int'(h_patch_grp) * 7
+                               + int'(load_cnt) / 24;
     automatic int k_word       = int'(load_cnt) % 24;
     h_fib_patch_addr = FAW'(global_patch * 24 + k_word);
 end
 
-// ── ILB addresses for Q/K/V results ──────────────────────────────────────
-// Q stored at ILB_Q_BASE, K at ILB_K_BASE, V at ILB_V_BASE.
-// Layout: [mat_base + col * N_PATCHES_WORDS + patch_grp * 7 + wb_cnt]
-// N_PATCHES_WORDS = 49 (one word per patch, one byte per patch per column)
 function automatic logic [OAW-1:0] qkv_ilb_base(input logic [1:0] mat);
     case (mat)
         2'd0: return OAW'(ILB_Q_BASE);
@@ -607,109 +539,126 @@ endfunction
 
 logic [OAW-1:0] h_qkv_omem_addr;
 assign h_qkv_omem_addr = qkv_ilb_base(h_qkv_mat)
-                        + OAW'(h_qkv_col_idx) * H_N_PATCHES
-                        + OAW'(h_patch_grp) * 7
-                        + OAW'(h_wb_cnt);
+                       + OAW'(h_qkv_col_idx) * H_N_PATCHES
+                       + OAW'(h_patch_grp) * 7
+                       + OAW'(h_wb_cnt);
 
-// ── Attention score addresses (QKᵀ) ──────────────────────────────────────
-// Read Q_head from ILB at ILB_Q_BASE + head*49*32 + col*49 + patch_grp*7
 logic [OAW-1:0] h_qh_rd_addr;
 assign h_qh_rd_addr = OAW'(ILB_Q_BASE)
-                     + OAW'(h_head_idx) * (H_N_PATCHES * H_HEAD_DIM)
-                     + OAW'(h_attn_col_idx) // reading the k-index column of Q_h as rows
-                     + OAW'(h_attn_rowgrp) * 7
-                     + OAW'(load_cnt);
+                    + OAW'(h_head_idx)      * (H_N_PATCHES * H_HEAD_DIM)
+                    + OAW'(h_attn_col_idx)
+                    + OAW'(h_attn_rowgrp)   * 7
+                    + OAW'(load_cnt);
 
-// Read K^T: K stored as 49×32 at ILB_K_BASE + head*49*32
-// K^T column j = K row j → read 32 elements starting at row j
 logic [OAW-1:0] h_kt_rd_addr;
 assign h_kt_rd_addr = OAW'(ILB_K_BASE)
-                     + OAW'(h_head_idx) * (H_N_PATCHES * H_HEAD_DIM)
-                     + OAW'(h_attn_col_idx) * H_HEAD_DIM  // col of K^T = row of K
-                     + OAW'(load_cnt);
+                    + OAW'(h_head_idx)      * (H_N_PATCHES * H_HEAD_DIM)
+                    + OAW'(h_attn_col_idx)  * H_HEAD_DIM
+                    + OAW'(load_cnt);
 
-// Attention output address (ILB_S_BASE)
 logic [OAW-1:0] h_attn_omem_addr;
 assign h_attn_omem_addr = OAW'(ILB_S_BASE)
-                         + OAW'(h_head_idx) * (H_N_PATCHES * H_N_PATCHES)
-                         + OAW'(h_attn_col_idx) * H_N_PATCHES
-                         + OAW'(h_attn_rowgrp) * 7
-                         + OAW'(h_wb_cnt);
+                        + OAW'(h_head_idx)     * (H_N_PATCHES * H_N_PATCHES)
+                        + OAW'(h_attn_col_idx) * H_N_PATCHES
+                        + OAW'(h_attn_rowgrp)  * 7
+                        + OAW'(h_wb_cnt);
 
-// ── SxV addresses ─────────────────────────────────────────────────────────
-// S head from ILB_S_BASE, V head from ILB_V_BASE
 logic [OAW-1:0] h_sh_rd_addr;
 assign h_sh_rd_addr = OAW'(ILB_S_BASE)
-                     + OAW'(h_head_idx) * (H_N_PATCHES * H_N_PATCHES)
-                     + OAW'(h_sxv_col_idx) // iterating over V columns
-                     + OAW'(h_sxv_rowgrp) * 7
-                     + OAW'(load_cnt);
+                    + OAW'(h_head_idx)    * (H_N_PATCHES * H_N_PATCHES)
+                    + OAW'(h_sxv_col_idx)
+                    + OAW'(h_sxv_rowgrp)  * 7
+                    + OAW'(load_cnt);
 
 logic [OAW-1:0] h_vh_rd_addr;
 assign h_vh_rd_addr = OAW'(ILB_V_BASE)
-                     + OAW'(h_head_idx) * (H_N_PATCHES * H_HEAD_DIM)
-                     + OAW'(h_sxv_col_idx) * H_N_PATCHES
-                     + OAW'(load_cnt);
+                    + OAW'(h_head_idx)    * (H_N_PATCHES * H_HEAD_DIM)
+                    + OAW'(h_sxv_col_idx) * H_N_PATCHES
+                    + OAW'(load_cnt);
 
 logic [OAW-1:0] h_sxv_omem_addr;
 assign h_sxv_omem_addr = OAW'(ILB_A_BASE)
-                        + OAW'(h_head_idx) * (H_N_PATCHES * H_HEAD_DIM)
-                        + OAW'(h_sxv_col_idx) * H_N_PATCHES
-                        + OAW'(h_sxv_rowgrp) * 7
-                        + OAW'(h_wb_cnt);
+                       + OAW'(h_head_idx)    * (H_N_PATCHES * H_HEAD_DIM)
+                       + OAW'(h_sxv_col_idx) * H_N_PATCHES
+                       + OAW'(h_sxv_rowgrp)  * 7
+                       + OAW'(h_wb_cnt);
 
-// ── W_proj, FFN1, FFN2 addresses ─────────────────────────────────────────
 logic [WAW-1:0] h_wproj_rd_addr;
 assign h_wproj_rd_addr = WAW'(WPROJ_BASE)
-                        + WAW'(h_proj_col_idx) * H_W_QKV_WORDS
-                        + WAW'(load_cnt);
+                       + WAW'(h_proj_col_idx) * H_W_QKV_WORDS
+                       + WAW'(load_cnt);
 
 logic [WAW-1:0] h_wffn1_rd_addr;
 assign h_wffn1_rd_addr = WAW'(WFFN1_BASE)
-                        + WAW'(h_ffn1_col_idx) * H_W_QKV_WORDS  // 96 rows → 24 words/col
-                        + WAW'(load_cnt);
+                       + WAW'(h_ffn1_col_idx) * H_W_QKV_WORDS
+                       + WAW'(load_cnt);
 
-// FFN2: 384 rows → 96 words/col
 logic [WAW-1:0] h_wffn2_rd_addr;
 assign h_wffn2_rd_addr = WAW'(WFFN2_BASE)
-                        + WAW'(h_ffn2_col_idx) * (H_C_FFN / 4)  // 96 words/col
-                        + WAW'(load_cnt);
+                       + WAW'(h_ffn2_col_idx) * (H_C_FFN / 4)
+                       + WAW'(load_cnt);
 
-// Proj input from ILB_A_BASE (concatenated 3×49×32 = 49×96)
 logic [OAW-1:0] h_proj_in_rd_addr;
 assign h_proj_in_rd_addr = OAW'(ILB_A_BASE)
-                          + OAW'(h_proj_rowgrp) * 7 * H_W_QKV_WORDS
-                          + OAW'(load_cnt);
+                         + OAW'(h_proj_rowgrp) * 7 * H_W_QKV_WORDS
+                         + OAW'(load_cnt);
 
 logic [OAW-1:0] h_proj_omem_addr;
 assign h_proj_omem_addr = OAW'(ILB_PROJ_BASE)
-                         + OAW'(h_proj_col_idx) * H_N_PATCHES
-                         + OAW'(h_proj_rowgrp) * 7
-                         + OAW'(h_wb_cnt);
+                        + OAW'(h_proj_col_idx) * H_N_PATCHES
+                        + OAW'(h_proj_rowgrp)  * 7
+                        + OAW'(h_wb_cnt);
 
-// FFN1 input: proj output (after shortcut) at ILB_PROJ_BASE
 logic [OAW-1:0] h_ffn1_in_rd_addr;
 assign h_ffn1_in_rd_addr = OAW'(ILB_PROJ_BASE)
-                           + OAW'(h_ffn1_rowgrp) * 7 * H_W_QKV_WORDS
-                           + OAW'(load_cnt);
+                         + OAW'(h_ffn1_rowgrp) * 7 * H_W_QKV_WORDS
+                         + OAW'(load_cnt);
 
 logic [OAW-1:0] h_ffn1_omem_addr;
 assign h_ffn1_omem_addr = OAW'(ILB_FFN1_BASE)
-                         + OAW'(h_ffn1_col_idx) * H_N_PATCHES
-                         + OAW'(h_ffn1_rowgrp) * 7
-                         + OAW'(h_wb_cnt);
+                        + OAW'(h_ffn1_col_idx) * H_N_PATCHES
+                        + OAW'(h_ffn1_rowgrp)  * 7
+                        + OAW'(h_wb_cnt);
 
-// FFN2 input: FFN1 GELU output at ILB_FFN1_BASE
 logic [OAW-1:0] h_ffn2_in_rd_addr;
 assign h_ffn2_in_rd_addr = OAW'(ILB_FFN1_BASE)
-                           + OAW'(h_ffn2_rowgrp) * 7 * (H_C_FFN / 4)  // 96 words/row
-                           + OAW'(load_cnt);
+                         + OAW'(h_ffn2_rowgrp) * 7 * (H_C_FFN / 4)
+                         + OAW'(load_cnt);
 
 logic [OAW-1:0] h_ffn2_omem_addr;
-assign h_ffn2_omem_addr = OAW'(ILB_PROJ_BASE)  // overwrite proj slot (reuse for final output)
-                         + OAW'(h_ffn2_col_idx) * H_N_PATCHES
-                         + OAW'(h_ffn2_rowgrp) * 7
-                         + OAW'(h_wb_cnt);
+assign h_ffn2_omem_addr = OAW'(ILB_PROJ_BASE)
+                        + OAW'(h_ffn2_col_idx) * H_N_PATCHES
+                        + OAW'(h_ffn2_rowgrp)  * 7
+                        + OAW'(h_wb_cnt);
+
+// =============================================================================
+// Address generation — Mask apply (NEW)
+// =============================================================================
+// ILB score element address:
+//   ILB_S_BASE
+//   + head_idx  × H_S_ELEMS          (2401 words per head)
+//   + window_idx × H_MASK_WIN_ELEMS   (49 words per sub-block)
+//   + element_idx                     (0..48 within the sub-block)
+//
+// mask_window_idx comes directly from mask_buffer (combinational) and is
+// stable for the entire 49-element R-M-W pass of each sub-block.
+// h_mask_elem_cnt is the sequential element counter driven by the FSM.
+// =============================================================================
+logic [OAW-1:0] h_mask_rd_addr;
+always_comb begin
+    h_mask_rd_addr = OAW'(ILB_S_BASE)
+                   + OAW'(h_head_idx)      * OAW'(H_S_ELEMS)
+                   + OAW'(mask_window_idx) * OAW'(H_MASK_WIN_ELEMS)
+                   + OAW'(h_mask_elem_cnt);
+end
+
+// Write-back address: registered copy of the read address issued one cycle
+// earlier (output_memory has 1-cycle read latency; wb uses the same address).
+logic [OAW-1:0] h_mask_wb_addr;
+always_ff @(posedge clk) begin
+    if (state == S_H_MASK_RD)
+        h_mask_wb_addr <= h_mask_rd_addr;
+end
 
 // =============================================================================
 // State register
@@ -729,14 +678,14 @@ always_comb begin
         S_IDLE: begin
             if (start)
                 case (mode)
-                    2'b00: next_state = S_C_INIT_PRELOAD;
-                    2'b01: next_state = S_M_L1_PRELOAD0;
-                    2'b10: next_state = S_H_LOAD_INPUT;
+                    2'b00:   next_state = S_C_INIT_PRELOAD;
+                    2'b01:   next_state = S_M_L1_PRELOAD0;
+                    2'b10:   next_state = S_H_LOAD_INPUT;
                     default: next_state = S_IDLE;
                 endcase
         end
 
-        // ── Conv (unchanged) ──────────────────────────────────────────────
+        // ── Conv ──────────────────────────────────────────────────────────
         S_C_INIT_PRELOAD:
             if (load_cyc == C_WLOAD_CYCS - 1) next_state = S_C_INIT_WMEM_SWAP;
         S_C_INIT_WMEM_SWAP:                    next_state = S_C_LOAD_W;
@@ -759,7 +708,7 @@ always_comb begin
                 next_state = S_C_LOAD_IMG;
         end
 
-        // ── MLP (unchanged) ───────────────────────────────────────────────
+        // ── MLP ───────────────────────────────────────────────────────────
         S_M_L1_PRELOAD0:
             if (load_cyc == M_W1_CYCS - 1)    next_state = S_M_L1_WMEM_SWAP0;
         S_M_L1_WMEM_SWAP0:                    next_state = S_M_L1_LOAD_X;
@@ -794,66 +743,95 @@ always_comb begin
             else                next_state = S_M_L1_PRELOAD0;
         end
 
-        // ── MHA ───────────────────────────────────────────────────────────
-        // QKV projection
+        // ── MHA — QKV ─────────────────────────────────────────────────────
         S_H_LOAD_INPUT:
             if (load_cyc == H_I_LOAD7_CYCS - 1) next_state = S_H_SWAP_INPUT;
         S_H_SWAP_INPUT:   next_state = S_H_LOAD_WQKV;
         S_H_LOAD_WQKV:
-            if (load_cyc == H_W_QKV_CYCS - 1) next_state = S_H_SWAP_WQKV;
+            if (load_cyc == H_W_QKV_CYCS - 1)   next_state = S_H_SWAP_WQKV;
         S_H_SWAP_WQKV:    next_state = S_H_COMPUTE_QKV;
         S_H_COMPUTE_QKV:
-            if (h_compute_cnt == H_N_ACC_QKV)  next_state = S_H_WRITEBACK_QKV;
+            if (h_compute_cnt == H_N_ACC_QKV)    next_state = S_H_WRITEBACK_QKV;
         S_H_WRITEBACK_QKV:
-            if (h_wb_cnt == H_OUT_WORDS - 1)   next_state = S_H_NEXT_QKV_COL;
+            if (h_wb_cnt == H_OUT_WORDS - 1)     next_state = S_H_NEXT_QKV_COL;
         S_H_NEXT_QKV_COL: begin
             if (h_last_qkv_col) next_state = S_H_NEXT_PATCH_GRP;
-            else                next_state = S_H_LOAD_WQKV;   // same patch group, new col
+            else                next_state = S_H_LOAD_WQKV;
         end
         S_H_NEXT_PATCH_GRP: begin
             if (h_last_patch_grp) next_state = S_H_NEXT_QKV_MAT;
-            else                  next_state = S_H_LOAD_INPUT;  // reload next 7 patches
+            else                  next_state = S_H_LOAD_INPUT;
         end
         S_H_NEXT_QKV_MAT: begin
-            if (h_qkv_mat == 2'd2) next_state = S_H_LOAD_QH;  // all Q,K,V done → attention
-            else                   next_state = S_H_LOAD_INPUT; // reload patches for K or V
+            if (h_qkv_mat == 2'd2) next_state = S_H_LOAD_QH;
+            else                   next_state = S_H_LOAD_INPUT;
         end
 
-        // Attention QKᵀ
+        // ── MHA — Attention QKᵀ ───────────────────────────────────────────
         S_H_LOAD_QH:
             if (load_cyc == H_QH_LOAD_CYCS - 1) next_state = S_H_SWAP_QH;
-        S_H_SWAP_QH:      next_state = S_H_LOAD_WKT;
+        S_H_SWAP_QH:   next_state = S_H_LOAD_WKT;
         S_H_LOAD_WKT:
-            if (load_cyc == H_WKT_CYCS - 1)   next_state = S_H_SWAP_WKT;
-        S_H_SWAP_WKT:     next_state = S_H_COMPUTE_ATTN;
+            if (load_cyc == H_WKT_CYCS - 1)     next_state = S_H_SWAP_WKT;
+        S_H_SWAP_WKT:  next_state = S_H_COMPUTE_ATTN;
         S_H_COMPUTE_ATTN:
-            if (h_compute_cnt == H_N_ACC_ATTN) next_state = S_H_WRITEBACK_ATTN;
+            if (h_compute_cnt == H_N_ACC_ATTN)   next_state = S_H_WRITEBACK_ATTN;
         S_H_WRITEBACK_ATTN:
-            if (h_wb_cnt == H_OUT_WORDS - 1)   next_state = S_H_NEXT_ATTN_COL;
+            if (h_wb_cnt == H_OUT_WORDS - 1)     next_state = S_H_NEXT_ATTN_COL;
         S_H_NEXT_ATTN_COL: begin
             if (h_last_attn_col) next_state = S_H_NEXT_ATTN_ROWGRP;
             else                 next_state = S_H_LOAD_WKT;
         end
         S_H_NEXT_ATTN_ROWGRP: begin
-            if (h_last_attn_rowgrp) next_state = S_H_NEXT_ATTN_HD;
+            // CHANGED (rev 4): when the last row-group of this head's 49×49
+            // score is done, enter the mask pass instead of going directly to
+            // S_H_NEXT_ATTN_HD.  Masking completes before the head counter
+            // advances, so every head's score matrix is masked in-place before
+            // S×V reads it.
+            if (h_last_attn_rowgrp) next_state = S_H_MASK_RD;   // ← changed
             else                    next_state = S_H_LOAD_QH;
         end
         S_H_NEXT_ATTN_HD: begin
-            if (h_last_head) next_state = S_H_LOAD_SH;  // all heads done → SxV
+            if (h_last_head) next_state = S_H_LOAD_SH;
             else             next_state = S_H_LOAD_QH;
         end
 
-        // SxV
+        // ── MHA — Mask apply (NEW) ─────────────────────────────────────────
+        // S_H_MASK_RD: issue ILB read for element h_mask_elem_cnt of sub-block
+        //              mask_window_idx.  Always takes exactly 1 cycle.
+        S_H_MASK_RD:
+            next_state = S_H_MASK_WB;
+
+        // S_H_MASK_WB: ILB data valid; write masked result back.
+        //              Increment element counter.
+        //              If last element of this window → S_H_MASK_NEXT_WIN.
+        //              Else → S_H_MASK_RD for the next element.
+        S_H_MASK_WB: begin
+            if (h_last_mask_elem) next_state = S_H_MASK_NEXT_WIN;
+            else                  next_state = S_H_MASK_RD;
+        end
+
+        // S_H_MASK_NEXT_WIN: pulse mask_next_window to advance mask_buffer.
+        //                    mask_all_done (from mask_buffer) tells us whether
+        //                    all 49 sub-blocks have been processed.
+        //                    If done → advance head counter.
+        //                    Else    → start next sub-block.
+        S_H_MASK_NEXT_WIN: begin
+            if (mask_all_done) next_state = S_H_NEXT_ATTN_HD;
+            else               next_state = S_H_MASK_RD;
+        end
+
+        // ── MHA — SxV ─────────────────────────────────────────────────────
         S_H_LOAD_SH:
             if (load_cyc == H_I_LOAD7_CYCS - 1) next_state = S_H_SWAP_SH;
-        S_H_SWAP_SH:      next_state = S_H_LOAD_VH;
+        S_H_SWAP_SH:   next_state = S_H_LOAD_VH;
         S_H_LOAD_VH:
-            if (load_cyc == H_WKT_CYCS - 1)   next_state = S_H_SWAP_VH;
-        S_H_SWAP_VH:      next_state = S_H_COMPUTE_SXV;
+            if (load_cyc == H_WKT_CYCS - 1)     next_state = S_H_SWAP_VH;
+        S_H_SWAP_VH:   next_state = S_H_COMPUTE_SXV;
         S_H_COMPUTE_SXV:
-            if (h_compute_cnt == H_N_ACC_SXV)  next_state = S_H_WRITEBACK_SXV;
+            if (h_compute_cnt == H_N_ACC_SXV)    next_state = S_H_WRITEBACK_SXV;
         S_H_WRITEBACK_SXV:
-            if (h_wb_cnt == H_OUT_WORDS - 1)   next_state = S_H_NEXT_SXV_COL;
+            if (h_wb_cnt == H_OUT_WORDS - 1)     next_state = S_H_NEXT_SXV_COL;
         S_H_NEXT_SXV_COL: begin
             if (h_last_sxv_col) next_state = S_H_NEXT_SXV_ROWGRP;
             else                next_state = S_H_LOAD_VH;
@@ -867,17 +845,17 @@ always_comb begin
             else             next_state = S_H_LOAD_SH;
         end
 
-        // W_proj
+        // ── MHA — W_proj ──────────────────────────────────────────────────
         S_H_PROJ_LOAD_INPUT:
             if (load_cyc == H_I_LOAD7_CYCS - 1) next_state = S_H_PROJ_SWAP_INPUT;
         S_H_PROJ_SWAP_INPUT: next_state = S_H_PROJ_LOAD_W;
         S_H_PROJ_LOAD_W:
-            if (load_cyc == H_W_QKV_CYCS - 1) next_state = S_H_PROJ_SWAP_W;
+            if (load_cyc == H_W_QKV_CYCS - 1)   next_state = S_H_PROJ_SWAP_W;
         S_H_PROJ_SWAP_W:     next_state = S_H_PROJ_COMPUTE;
         S_H_PROJ_COMPUTE:
-            if (h_compute_cnt == H_N_ACC_PROJ) next_state = S_H_PROJ_WRITEBACK;
+            if (h_compute_cnt == H_N_ACC_PROJ)   next_state = S_H_PROJ_WRITEBACK;
         S_H_PROJ_WRITEBACK:
-            if (h_wb_cnt == H_OUT_WORDS - 1)   next_state = S_H_PROJ_NEXT_COL;
+            if (h_wb_cnt == H_OUT_WORDS - 1)     next_state = S_H_PROJ_NEXT_COL;
         S_H_PROJ_NEXT_COL: begin
             if (h_last_proj_col) next_state = S_H_PROJ_NEXT_ROWGRP;
             else                 next_state = S_H_PROJ_LOAD_W;
@@ -886,19 +864,19 @@ always_comb begin
             if (h_last_proj_rowgrp) next_state = S_H_SHORTCUT1;
             else                    next_state = S_H_PROJ_LOAD_INPUT;
         end
-        S_H_SHORTCUT1: next_state = S_H_FFN1_LOAD_INPUT;  // 1-cycle shortcut add
+        S_H_SHORTCUT1: next_state = S_H_FFN1_LOAD_INPUT;
 
-        // FFN1
+        // ── MHA — FFN1 ────────────────────────────────────────────────────
         S_H_FFN1_LOAD_INPUT:
             if (load_cyc == H_I_LOAD7_CYCS - 1) next_state = S_H_FFN1_SWAP_INPUT;
         S_H_FFN1_SWAP_INPUT: next_state = S_H_FFN1_LOAD_W;
         S_H_FFN1_LOAD_W:
-            if (load_cyc == H_W_QKV_CYCS - 1) next_state = S_H_FFN1_SWAP_W;
+            if (load_cyc == H_W_QKV_CYCS - 1)   next_state = S_H_FFN1_SWAP_W;
         S_H_FFN1_SWAP_W:     next_state = S_H_FFN1_COMPUTE;
         S_H_FFN1_COMPUTE:
-            if (h_compute_cnt == H_N_ACC_FFN1) next_state = S_H_FFN1_WRITEBACK;
+            if (h_compute_cnt == H_N_ACC_FFN1)   next_state = S_H_FFN1_WRITEBACK;
         S_H_FFN1_WRITEBACK:
-            if (h_wb_cnt == H_OUT_WORDS - 1)   next_state = S_H_FFN1_NEXT_COL;
+            if (h_wb_cnt == H_OUT_WORDS - 1)     next_state = S_H_FFN1_NEXT_COL;
         S_H_FFN1_NEXT_COL: begin
             if (h_last_ffn1_col) next_state = S_H_FFN1_NEXT_ROWGRP;
             else                 next_state = S_H_FFN1_LOAD_W;
@@ -907,19 +885,19 @@ always_comb begin
             if (h_last_ffn1_rowgrp) next_state = S_H_GELU_WAIT;
             else                    next_state = S_H_FFN1_LOAD_INPUT;
         end
-        S_H_GELU_WAIT: next_state = S_H_FFN2_LOAD_INPUT;  // GCU pipeline drain
+        S_H_GELU_WAIT: next_state = S_H_FFN2_LOAD_INPUT;
 
-        // FFN2
+        // ── MHA — FFN2 ────────────────────────────────────────────────────
         S_H_FFN2_LOAD_INPUT:
             if (load_cyc == H_I_LOAD7_CYCS - 1) next_state = S_H_FFN2_SWAP_INPUT;
         S_H_FFN2_SWAP_INPUT: next_state = S_H_FFN2_LOAD_W;
         S_H_FFN2_LOAD_W:
-            if (load_cyc == (H_C_FFN/4)*2 - 1) next_state = S_H_FFN2_SWAP_W;
+            if (load_cyc == (H_C_FFN/4)*2 - 1)  next_state = S_H_FFN2_SWAP_W;
         S_H_FFN2_SWAP_W:     next_state = S_H_FFN2_COMPUTE;
         S_H_FFN2_COMPUTE:
-            if (h_compute_cnt == H_N_ACC_FFN2) next_state = S_H_FFN2_WRITEBACK;
+            if (h_compute_cnt == H_N_ACC_FFN2)   next_state = S_H_FFN2_WRITEBACK;
         S_H_FFN2_WRITEBACK:
-            if (h_wb_cnt == H_OUT_WORDS - 1)   next_state = S_H_FFN2_NEXT_COL;
+            if (h_wb_cnt == H_OUT_WORDS - 1)     next_state = S_H_FFN2_NEXT_COL;
         S_H_FFN2_NEXT_COL: begin
             if (h_last_ffn2_col) next_state = S_H_FFN2_NEXT_ROWGRP;
             else                 next_state = S_H_FFN2_LOAD_W;
@@ -928,10 +906,10 @@ always_comb begin
             if (h_last_ffn2_rowgrp) next_state = S_H_SHORTCUT2;
             else                    next_state = S_H_FFN2_LOAD_INPUT;
         end
-        S_H_SHORTCUT2: next_state = S_H_NEXT_WINDOW;
+        S_H_SHORTCUT2:  next_state = S_H_NEXT_WINDOW;
         S_H_NEXT_WINDOW: begin
             if (h_last_win) next_state = S_DONE;
-            else            next_state = S_H_LOAD_INPUT;  // next window → Q step
+            else            next_state = S_H_LOAD_INPUT;
         end
 
         S_DONE:  next_state = S_DONE;
@@ -958,21 +936,22 @@ always_ff @(posedge clk or negedge rst_n) begin
         h_ffn1_rowgrp   <= '0; h_ffn2_col_idx   <= '0;
         h_ffn2_rowgrp   <= '0; h_compute_cnt    <= '0;
         h_wb_cnt        <= '0;
+        h_mask_elem_cnt <= '0;   // NEW
     end else begin
         case (state)
 
-            // ── load_cyc resets ────────────────────────────────────────────
+            // ── load_cyc resets ───────────────────────────────────────────
             S_IDLE,
-            S_C_INIT_WMEM_SWAP, S_C_SWAP_W,   S_C_SWAP_IMG,  S_C_NEXT,
-            S_M_L1_WMEM_SWAP0,  S_M_L1_SWAP_X, S_M_L1_SWAP_W, S_M_L1_NEXT_COL,
+            S_C_INIT_WMEM_SWAP, S_C_SWAP_W,    S_C_SWAP_IMG,   S_C_NEXT,
+            S_M_L1_WMEM_SWAP0,  S_M_L1_SWAP_X, S_M_L1_SWAP_W,  S_M_L1_NEXT_COL,
             S_M_L2_WMEM_SWAP0,  S_M_L2_SWAP_W, S_M_L2_NEXT_COL, S_M_NEXT_ROW,
-            S_H_SWAP_INPUT, S_H_SWAP_WQKV, S_H_SWAP_QH, S_H_SWAP_WKT,
-            S_H_SWAP_SH, S_H_SWAP_VH, S_H_PROJ_SWAP_INPUT, S_H_PROJ_SWAP_W,
+            S_H_SWAP_INPUT, S_H_SWAP_WQKV, S_H_SWAP_QH,  S_H_SWAP_WKT,
+            S_H_SWAP_SH,    S_H_SWAP_VH,    S_H_PROJ_SWAP_INPUT, S_H_PROJ_SWAP_W,
             S_H_FFN1_SWAP_INPUT, S_H_FFN1_SWAP_W,
             S_H_FFN2_SWAP_INPUT, S_H_FFN2_SWAP_W:
                 load_cyc <= '0;
 
-            // ── Conv ───────────────────────────────────────────────────────
+            // ── Conv ──────────────────────────────────────────────────────
             S_C_INIT_PRELOAD, S_C_LOAD_W:
                 load_cyc <= (load_cyc < C_WLOAD_CYCS - 1) ? load_cyc + 1 : '0;
             S_C_LOAD_IMG:
@@ -994,7 +973,7 @@ always_ff @(posedge clk or negedge rst_n) begin
                 end
             end
 
-            // ── MLP ────────────────────────────────────────────────────────
+            // ── MLP ───────────────────────────────────────────────────────
             S_M_L1_PRELOAD0:
                 load_cyc <= (load_cyc < M_W1_CYCS - 1) ? load_cyc + 1 : '0;
             S_M_L1_LOAD_X:
@@ -1026,19 +1005,19 @@ always_ff @(posedge clk or negedge rst_n) begin
                 m_l1_col_idx  <= '0; m_l2_col_idx <= '0; m_compute_cnt <= '0;
             end
 
-            // ── MHA ────────────────────────────────────────────────────────
+            // ── MHA ───────────────────────────────────────────────────────
             S_H_LOAD_INPUT, S_H_LOAD_SH, S_H_PROJ_LOAD_INPUT,
             S_H_FFN1_LOAD_INPUT, S_H_FFN2_LOAD_INPUT:
                 load_cyc <= (load_cyc < H_I_LOAD7_CYCS - 1) ? load_cyc + 1 : '0;
 
             S_H_LOAD_WQKV, S_H_PROJ_LOAD_W, S_H_FFN1_LOAD_W:
-                load_cyc <= (load_cyc < H_W_QKV_CYCS - 1) ? load_cyc + 1 : '0;
+                load_cyc <= (load_cyc < H_W_QKV_CYCS - 1)  ? load_cyc + 1 : '0;
 
             S_H_LOAD_QH:
                 load_cyc <= (load_cyc < H_QH_LOAD_CYCS - 1) ? load_cyc + 1 : '0;
 
             S_H_LOAD_WKT, S_H_LOAD_VH:
-                load_cyc <= (load_cyc < H_WKT_CYCS - 1) ? load_cyc + 1 : '0;
+                load_cyc <= (load_cyc < H_WKT_CYCS - 1)    ? load_cyc + 1 : '0;
 
             S_H_FFN2_LOAD_W:
                 load_cyc <= (load_cyc < (H_C_FFN/4)*2 - 1) ? load_cyc + 1 : '0;
@@ -1064,89 +1043,95 @@ always_ff @(posedge clk or negedge rst_n) begin
 
             // Column / group advance
             S_H_NEXT_QKV_COL: begin
-                if (h_last_qkv_col) h_qkv_col_idx <= '0;
-                else                h_qkv_col_idx <= h_qkv_col_idx + 1;
+                h_qkv_col_idx <= h_last_qkv_col ? '0 : h_qkv_col_idx + 1;
                 h_compute_cnt <= '0; h_wb_cnt <= '0;
             end
             S_H_NEXT_PATCH_GRP: begin
-                if (h_last_patch_grp) h_patch_grp <= '0;
-                else                  h_patch_grp <= h_patch_grp + 1;
+                h_patch_grp <= h_last_patch_grp ? '0 : h_patch_grp + 1;
             end
             S_H_NEXT_QKV_MAT: begin
-                h_qkv_mat    <= (h_qkv_mat == 2'd2) ? '0 : h_qkv_mat + 1;
-                h_patch_grp  <= '0;
-                h_qkv_col_idx<= '0;
+                h_qkv_mat     <= (h_qkv_mat == 2'd2) ? '0 : h_qkv_mat + 1;
+                h_patch_grp   <= '0;
+                h_qkv_col_idx <= '0;
             end
             S_H_NEXT_ATTN_COL: begin
-                if (h_last_attn_col) h_attn_col_idx <= '0;
-                else                 h_attn_col_idx <= h_attn_col_idx + 1;
-                h_compute_cnt <= '0; h_wb_cnt <= '0;
+                h_attn_col_idx <= h_last_attn_col ? '0 : h_attn_col_idx + 1;
+                h_compute_cnt  <= '0; h_wb_cnt <= '0;
             end
             S_H_NEXT_ATTN_ROWGRP: begin
-                if (h_last_attn_rowgrp) h_attn_rowgrp <= '0;
-                else                    h_attn_rowgrp <= h_attn_rowgrp + 1;
+                h_attn_rowgrp  <= h_last_attn_rowgrp ? '0 : h_attn_rowgrp + 1;
                 h_attn_col_idx <= '0;
             end
+            // CHANGED (rev 4): also reset h_mask_elem_cnt here for cleanliness,
+            // though S_H_MASK_NEXT_WIN already resets it before we reach this state.
             S_H_NEXT_ATTN_HD: begin
-                if (h_last_head) h_head_idx <= '0;
-                else             h_head_idx <= h_head_idx + 1;
-                h_attn_rowgrp <= '0; h_attn_col_idx <= '0;
+                h_head_idx      <= h_last_head ? '0 : h_head_idx + 1;
+                h_attn_rowgrp   <= '0; h_attn_col_idx   <= '0;
+                h_mask_elem_cnt <= '0;   // defensive reset
             end
+
+            // ── Mask apply counters (NEW) ──────────────────────────────────
+            // S_H_MASK_RD: no counter change — 1-cycle read issue state.
+            S_H_MASK_RD: ; // intentionally empty
+
+            // S_H_MASK_WB: increment element counter.
+            // Wraps to 0 at the end of each 49-element sub-block window.
+            S_H_MASK_WB: begin
+                h_mask_elem_cnt <= h_last_mask_elem ? '0 : h_mask_elem_cnt + 1;
+            end
+
+            // S_H_MASK_NEXT_WIN: element counter already reset in S_H_MASK_WB
+            // (wraps to 0 on the last element).  No extra action needed here.
+            S_H_MASK_NEXT_WIN: ; // intentionally empty
+
+            // Remaining MHA advance states (unchanged)
             S_H_NEXT_SXV_COL: begin
-                if (h_last_sxv_col) h_sxv_col_idx <= '0;
-                else                h_sxv_col_idx <= h_sxv_col_idx + 1;
+                h_sxv_col_idx <= h_last_sxv_col ? '0 : h_sxv_col_idx + 1;
                 h_compute_cnt <= '0; h_wb_cnt <= '0;
             end
             S_H_NEXT_SXV_ROWGRP: begin
-                if (h_last_sxv_rowgrp) h_sxv_rowgrp <= '0;
-                else                   h_sxv_rowgrp <= h_sxv_rowgrp + 1;
+                h_sxv_rowgrp  <= h_last_sxv_rowgrp ? '0 : h_sxv_rowgrp + 1;
                 h_sxv_col_idx <= '0;
             end
             S_H_NEXT_SXV_HD: begin
-                if (h_last_head) h_head_idx <= '0;
-                else             h_head_idx <= h_head_idx + 1;
+                h_head_idx   <= h_last_head ? '0 : h_head_idx + 1;
                 h_sxv_rowgrp <= '0; h_sxv_col_idx <= '0;
             end
             S_H_PROJ_NEXT_COL: begin
-                if (h_last_proj_col) h_proj_col_idx <= '0;
-                else                 h_proj_col_idx <= h_proj_col_idx + 1;
-                h_compute_cnt <= '0; h_wb_cnt <= '0;
+                h_proj_col_idx <= h_last_proj_col ? '0 : h_proj_col_idx + 1;
+                h_compute_cnt  <= '0; h_wb_cnt <= '0;
             end
             S_H_PROJ_NEXT_ROWGRP: begin
-                if (h_last_proj_rowgrp) h_proj_rowgrp <= '0;
-                else                    h_proj_rowgrp <= h_proj_rowgrp + 1;
+                h_proj_rowgrp  <= h_last_proj_rowgrp ? '0 : h_proj_rowgrp + 1;
                 h_proj_col_idx <= '0;
             end
             S_H_FFN1_NEXT_COL: begin
-                if (h_last_ffn1_col) h_ffn1_col_idx <= '0;
-                else                 h_ffn1_col_idx <= h_ffn1_col_idx + 1;
-                h_compute_cnt <= '0; h_wb_cnt <= '0;
+                h_ffn1_col_idx <= h_last_ffn1_col ? '0 : h_ffn1_col_idx + 1;
+                h_compute_cnt  <= '0; h_wb_cnt <= '0;
             end
             S_H_FFN1_NEXT_ROWGRP: begin
-                if (h_last_ffn1_rowgrp) h_ffn1_rowgrp <= '0;
-                else                    h_ffn1_rowgrp <= h_ffn1_rowgrp + 1;
+                h_ffn1_rowgrp  <= h_last_ffn1_rowgrp ? '0 : h_ffn1_rowgrp + 1;
                 h_ffn1_col_idx <= '0;
             end
             S_H_FFN2_NEXT_COL: begin
-                if (h_last_ffn2_col) h_ffn2_col_idx <= '0;
-                else                 h_ffn2_col_idx <= h_ffn2_col_idx + 1;
-                h_compute_cnt <= '0; h_wb_cnt <= '0;
+                h_ffn2_col_idx <= h_last_ffn2_col ? '0 : h_ffn2_col_idx + 1;
+                h_compute_cnt  <= '0; h_wb_cnt <= '0;
             end
             S_H_FFN2_NEXT_ROWGRP: begin
-                if (h_last_ffn2_rowgrp) h_ffn2_rowgrp <= '0;
-                else                    h_ffn2_rowgrp <= h_ffn2_rowgrp + 1;
+                h_ffn2_rowgrp  <= h_last_ffn2_rowgrp ? '0 : h_ffn2_rowgrp + 1;
                 h_ffn2_col_idx <= '0;
             end
             S_H_NEXT_WINDOW: begin
-                h_win_idx     <= h_last_win ? h_win_idx : h_win_idx + 1;
-                h_qkv_mat     <= '0; h_qkv_col_idx  <= '0;
-                h_patch_grp   <= '0; h_head_idx      <= '0;
-                h_attn_col_idx<= '0; h_attn_rowgrp   <= '0;
-                h_sxv_col_idx <= '0; h_sxv_rowgrp    <= '0;
-                h_proj_col_idx<= '0; h_proj_rowgrp   <= '0;
-                h_ffn1_col_idx<= '0; h_ffn1_rowgrp   <= '0;
-                h_ffn2_col_idx<= '0; h_ffn2_rowgrp   <= '0;
-                h_compute_cnt <= '0; h_wb_cnt         <= '0;
+                h_win_idx       <= h_last_win ? h_win_idx : h_win_idx + 1;
+                h_qkv_mat       <= '0; h_qkv_col_idx   <= '0;
+                h_patch_grp     <= '0; h_head_idx       <= '0;
+                h_attn_col_idx  <= '0; h_attn_rowgrp    <= '0;
+                h_sxv_col_idx   <= '0; h_sxv_rowgrp     <= '0;
+                h_proj_col_idx  <= '0; h_proj_rowgrp     <= '0;
+                h_ffn1_col_idx  <= '0; h_ffn1_rowgrp    <= '0;
+                h_ffn2_col_idx  <= '0; h_ffn2_rowgrp    <= '0;
+                h_compute_cnt   <= '0; h_wb_cnt          <= '0;
+                h_mask_elem_cnt <= '0;   // defensive reset for new window
             end
 
             default: ;
@@ -1161,23 +1146,47 @@ assign done = (state == S_DONE);
 
 // =============================================================================
 // omem_fb_en_ctrl
-// Asserted for all MHA states that read from the ILB (output_memory)
-// rather than the FIB.
+// Asserted for all MHA states that read from the ILB rather than the FIB.
+// CHANGED (rev 4): S_H_MASK_RD added — the mask R-M-W reads score elements
+// from ILB, so the feedback path must be selected.
 // =============================================================================
 always_comb begin
     omem_fb_en_ctrl = 1'b0;
     case (state)
-        // QKV: read patches from FIB → keep 0
-        // Attention: read Q/K from ILB
         S_H_LOAD_QH, S_H_LOAD_WKT, S_H_LOAD_SH, S_H_LOAD_VH,
-        S_H_PROJ_LOAD_INPUT, S_H_FFN1_LOAD_INPUT, S_H_FFN2_LOAD_INPUT:
+        S_H_PROJ_LOAD_INPUT, S_H_FFN1_LOAD_INPUT, S_H_FFN2_LOAD_INPUT,
+        S_H_MASK_RD:                                              // NEW
             omem_fb_en_ctrl = 1'b1;
         default: ;
     endcase
 end
 
 // =============================================================================
-// MMU sub-cycle
+// Mask buffer control outputs (NEW)
+// =============================================================================
+
+// qkt_store_done: fire when the last row-group of a head's 49×49 QK^T is
+// done, i.e. in S_H_NEXT_ATTN_ROWGRP while h_last_attn_rowgrp is true.
+// This is the same cycle the FSM decides to go to S_H_MASK_RD, so the
+// mask_buffer has its rd_ptr reset to 0 and mask_valid rises on the very
+// next clock — exactly when S_H_MASK_RD is entered.
+always_comb begin
+    qkt_store_done = 1'b0;
+    if (state == S_H_NEXT_ATTN_ROWGRP && h_last_attn_rowgrp)
+        qkt_store_done = 1'b1;
+end
+
+// mask_next_window: pulse for one cycle in S_H_MASK_NEXT_WIN to advance
+// mask_buffer.rd_ptr.  mask_buffer registers this on the rising edge and
+// presents the new mask_data_out / mask_window_idx combinationally.
+always_comb begin
+    mask_next_window = 1'b0;
+    if (state == S_H_MASK_NEXT_WIN)
+        mask_next_window = 1'b1;
+end
+
+// =============================================================================
+// MMU sub-cycle (unchanged)
 // =============================================================================
 always_comb begin
     case (state)
@@ -1201,7 +1210,7 @@ always_comb begin
 end
 
 // =============================================================================
-// Weight memory — active bank read
+// Weight memory — active bank read (unchanged)
 // =============================================================================
 always_comb begin
     wmem_rd_addr = '0;
@@ -1240,9 +1249,7 @@ always_comb begin
 end
 
 // =============================================================================
-// Weight memory — shadow bank write + external big memory read (Conv/MLP only)
-// MHA loads weights directly via the active-bank read path above;
-// K^T and V are loaded from ILB via imem (feedback path), not wmem shadow.
+// Weight memory — shadow bank / external (unchanged)
 // =============================================================================
 always_comb begin
     ext_weight_rd_addr  = '0;
@@ -1250,7 +1257,6 @@ always_comb begin
     wmem_shadow_wr_addr = '0;
     wmem_shadow_wr_en   = 1'b0;
     wmem_swap           = 1'b0;
-
     case (state)
         S_C_INIT_PRELOAD: begin
             ext_weight_rd_en    = !is_data_ph;
@@ -1267,15 +1273,14 @@ always_comb begin
                 wmem_shadow_wr_addr = c_shadow_next_addr;
             end
         end
-        S_C_SWAP_W:         wmem_swap = 1'b1;
-
+        S_C_SWAP_W: wmem_swap = 1'b1;
         S_M_L1_PRELOAD0: begin
             ext_weight_rd_en    = !is_data_ph;
             ext_weight_rd_addr  = WAW'(load_cnt);
             wmem_shadow_wr_en   = is_data_ph;
             wmem_shadow_wr_addr = WAW'(load_cnt);
         end
-        S_M_L1_WMEM_SWAP0:  wmem_swap = 1'b1;
+        S_M_L1_WMEM_SWAP0: wmem_swap = 1'b1;
         S_M_L1_LOAD_W: begin
             if (!m_last_l1_col) begin
                 ext_weight_rd_en    = !is_data_ph;
@@ -1284,14 +1289,14 @@ always_comb begin
                 wmem_shadow_wr_addr = m_shadow_w1_next_addr;
             end
         end
-        S_M_L1_SWAP_W:      wmem_swap = 1'b1;
+        S_M_L1_SWAP_W: wmem_swap = 1'b1;
         S_M_L2_PRELOAD0: begin
             ext_weight_rd_en    = !is_data_ph;
             ext_weight_rd_addr  = WAW'(W2_BASE) + WAW'(load_cnt);
             wmem_shadow_wr_en   = is_data_ph;
             wmem_shadow_wr_addr = WAW'(W2_BASE) + WAW'(load_cnt);
         end
-        S_M_L2_WMEM_SWAP0:  wmem_swap = 1'b1;
+        S_M_L2_WMEM_SWAP0: wmem_swap = 1'b1;
         S_M_L2_LOAD_W: begin
             if (!m_last_l2_col) begin
                 ext_weight_rd_en    = !is_data_ph;
@@ -1300,18 +1305,13 @@ always_comb begin
                 wmem_shadow_wr_addr = m_shadow_w2_next_addr;
             end
         end
-        S_M_L2_SWAP_W:      wmem_swap = 1'b1;
-
-        // MHA weights come from a large external weight store; for simplicity
-        // in this revision the MHA weight path uses direct active-bank reads
-        // (no double-buffering for MHA weights — can be added as a future
-        //  optimisation identical to the Conv/MLP pattern above).
+        S_M_L2_SWAP_W: wmem_swap = 1'b1;
         default: ;
     endcase
 end
 
 // =============================================================================
-// Input / feature memory outputs
+// Input / feature memory (imem_rd) — unchanged except mask states add nothing
 // =============================================================================
 always_comb begin
     imem_rd_addr = '0;
@@ -1325,32 +1325,26 @@ always_comb begin
             imem_rd_addr = m_xmem_addr;
             imem_rd_en   = !is_data_ph;
         end
-        // MHA: load 7 patches from FIB (omem_fb_en=0 in top during these states)
         S_H_LOAD_INPUT: begin
             imem_rd_addr = OAW'(h_fib_patch_addr);
             imem_rd_en   = !is_data_ph;
         end
-        // MHA: read Q_h row-group from ILB (omem_fb_en=1 in top)
         S_H_LOAD_QH: begin
             imem_rd_addr = h_qh_rd_addr;
             imem_rd_en   = !is_data_ph;
         end
-        // MHA: read S_h row-group from ILB
         S_H_LOAD_SH: begin
             imem_rd_addr = h_sh_rd_addr;
             imem_rd_en   = !is_data_ph;
         end
-        // MHA: K^T column loaded as weights via imem (feedback)
         S_H_LOAD_WKT: begin
             imem_rd_addr = h_kt_rd_addr;
             imem_rd_en   = !is_data_ph;
         end
-        // MHA: V_h column loaded via imem (feedback)
         S_H_LOAD_VH: begin
             imem_rd_addr = h_vh_rd_addr;
             imem_rd_en   = !is_data_ph;
         end
-        // Proj, FFN1, FFN2 input patches from ILB
         S_H_PROJ_LOAD_INPUT: begin
             imem_rd_addr = h_proj_in_rd_addr;
             imem_rd_en   = !is_data_ph;
@@ -1363,12 +1357,24 @@ always_comb begin
             imem_rd_addr = h_ffn2_in_rd_addr;
             imem_rd_en   = !is_data_ph;
         end
+        // ── Mask RD: drive the ILB score element address on imem_rd ───────
+        // omem_fb_en_ctrl=1 causes full_system_top to route this to
+        // output_memory.fb_rd_addr.  The read result (fb_rd_data) arrives
+        // one cycle later in S_H_MASK_WB via the feedback path.
+        S_H_MASK_RD: begin
+            imem_rd_addr = h_mask_rd_addr;
+            imem_rd_en   = 1'b1;
+        end
         default: ;
     endcase
 end
 
 // =============================================================================
-// Output memory write outputs
+// Output memory write
+// CHANGED (rev 4): S_H_MASK_WB added.
+// In full_system_top, ilb_wr_bypass=1 for all MHA states (mode==2'b10), so
+// output_memory will store ilb_raw_wr_data = fb_rd_data + mask_data_out
+// (the adder lives in full_system_top, not here).
 // =============================================================================
 always_comb begin
     omem_wr_addr = '0;
@@ -1406,12 +1412,19 @@ always_comb begin
             omem_wr_addr = h_ffn2_omem_addr;
             omem_wr_en   = 1'b1;
         end
+        // NEW: write masked score element back to the same ILB location.
+        // Address is the registered capture of the read address issued one
+        // cycle earlier in S_H_MASK_RD.
+        S_H_MASK_WB: begin
+            omem_wr_addr = h_mask_wb_addr;
+            omem_wr_en   = 1'b1;
+        end
         default: ;
     endcase
 end
 
 // =============================================================================
-// Weight buffer control outputs
+// Weight buffer control (unchanged)
 // =============================================================================
 always_comb begin
     wbuf_load_en        = 1'b0;
@@ -1421,7 +1434,6 @@ always_comb begin
     wbuf_bias_load_en   = 1'b0;
     wbuf_bias_load_data = '0;
     wbuf_swap           = 1'b0;
-
     case (state)
         S_C_LOAD_W: begin
             wbuf_load_en        = is_data_ph && (load_cnt < 12);
@@ -1431,22 +1443,18 @@ always_comb begin
             wbuf_bias_load_data = wmem_rd_data;
         end
         S_C_SWAP_W: wbuf_swap = 1'b1;
-
         S_M_L1_LOAD_W: begin
             wbuf_load_en     = is_data_ph;
             wbuf_load_k_word = 7'(load_cnt);
             wbuf_load_data   = wmem_rd_data;
         end
         S_M_L1_SWAP_W: wbuf_swap = 1'b1;
-
         S_M_L2_LOAD_W: begin
             wbuf_load_en     = is_data_ph;
             wbuf_load_k_word = 7'(load_cnt);
             wbuf_load_data   = wmem_rd_data;
         end
         S_M_L2_SWAP_W: wbuf_swap = 1'b1;
-
-        // MHA weight loads (W_Q/K/V/proj): reuse MLP k_word path
         S_H_LOAD_WQKV, S_H_PROJ_LOAD_W, S_H_FFN1_LOAD_W, S_H_FFN2_LOAD_W: begin
             wbuf_load_en     = is_data_ph;
             wbuf_load_k_word = 7'(load_cnt);
@@ -1454,42 +1462,35 @@ always_comb begin
         end
         S_H_SWAP_WQKV, S_H_PROJ_SWAP_W,
         S_H_FFN1_SWAP_W, S_H_FFN2_SWAP_W: wbuf_swap = 1'b1;
-
-        // MHA: K^T column / V column loaded from ILB via imem
-        // → feed into wbuf using the k_word index (same as MLP)
         S_H_LOAD_WKT, S_H_LOAD_VH: begin
             wbuf_load_en     = is_data_ph;
             wbuf_load_k_word = 7'(load_cnt);
-            wbuf_load_data   = imem_rd_data;  // comes from ILB feedback path
+            wbuf_load_data   = imem_rd_data;
         end
         S_H_SWAP_WKT, S_H_SWAP_VH: wbuf_swap = 1'b1;
-
         default: ;
     endcase
 end
 
 // =============================================================================
-// Input buffer control outputs
+// Input buffer control (unchanged)
 // =============================================================================
 always_comb begin
-    ibuf_load_en       = 1'b0;
-    ibuf_load_pe_idx   = '0;
-    ibuf_load_win_idx  = '0;
-    ibuf_load_row      = '0;
-    ibuf_load_k_word   = '0;
-    ibuf_load_data     = '0;
-    ibuf_swap          = 1'b0;
-    ibuf_l1_capture_en = 1'b0;
-    ibuf_l1_col_wr     = '0;
-    // MHA-specific
+    ibuf_load_en          = 1'b0;
+    ibuf_load_pe_idx      = '0;
+    ibuf_load_win_idx     = '0;
+    ibuf_load_row         = '0;
+    ibuf_load_k_word      = '0;
+    ibuf_load_data        = '0;
+    ibuf_swap             = 1'b0;
+    ibuf_l1_capture_en    = 1'b0;
+    ibuf_l1_col_wr        = '0;
     ibuf_mha_load_en      = 1'b0;
     ibuf_mha_load_patch   = '0;
     ibuf_mha_load_k_word  = '0;
     ibuf_mha_load_data    = '0;
     ibuf_mha_capture_row  = '0;
-
     case (state)
-        // Conv
         S_C_LOAD_IMG: begin
             ibuf_load_en      = is_data_ph;
             ibuf_load_pe_idx  = c_img_pe;
@@ -1497,8 +1498,6 @@ always_comb begin
             ibuf_load_data    = imem_rd_data;
         end
         S_C_SWAP_IMG: ibuf_swap = 1'b1;
-
-        // MLP
         S_M_L1_LOAD_X: begin
             ibuf_load_en     = is_data_ph;
             ibuf_load_row    = 3'(m_x_sub_row[2:0]);
@@ -1512,13 +1511,12 @@ always_comb begin
         end
         S_M_L1_NEXT_COL:
             ibuf_swap = m_last_l1_col;
-
-        // MHA: load 7 patches into ibuf (MHA mode)
         S_H_LOAD_INPUT, S_H_LOAD_QH, S_H_LOAD_SH,
         S_H_PROJ_LOAD_INPUT, S_H_FFN1_LOAD_INPUT, S_H_FFN2_LOAD_INPUT: begin
             if (is_data_ph) begin
                 ibuf_mha_load_en     = 1'b1;
-                ibuf_mha_load_patch  = 6'(int'(h_patch_grp) * 7 + int'(load_cnt) / (H_C_IN/4));
+                ibuf_mha_load_patch  = 6'(int'(h_patch_grp) * 7
+                                        + int'(load_cnt) / (H_C_IN/4));
                 ibuf_mha_load_k_word = 5'(int'(load_cnt) % (H_C_IN/4));
                 ibuf_mha_load_data   = imem_rd_data;
             end
@@ -1526,71 +1524,66 @@ always_comb begin
         S_H_SWAP_INPUT, S_H_SWAP_QH, S_H_SWAP_SH,
         S_H_PROJ_SWAP_INPUT, S_H_FFN1_SWAP_INPUT, S_H_FFN2_SWAP_INPUT:
             ibuf_swap = 1'b1;
-
-        // MHA: capture QKV output rows back into ibuf shadow bank
         S_H_WRITEBACK_QKV: begin
             ibuf_l1_capture_en   = 1'b1;
             ibuf_l1_col_wr       = 9'(h_qkv_col_idx);
             ibuf_mha_capture_row = 6'(int'(h_patch_grp) * 7);
         end
-
         default: ;
     endcase
 end
 
 // =============================================================================
-// MMU control outputs
+// MMU control (unchanged)
 // =============================================================================
 always_comb begin
     mmu_valid_in = 1'b0;
     mmu_op_code  = 3'd0;
     mmu_stage    = 2'd0;
-
     case (state)
         S_C_COMPUTE, S_C_WAIT_OUT: begin
             mmu_valid_in = 1'b1;
-            mmu_op_code  = 3'd0;   // Conv
+            mmu_op_code  = 3'd0;
             mmu_stage    = 2'd0;
         end
         S_M_L1_COMPUTE: begin
             mmu_valid_in = 1'b1;
-            mmu_op_code  = 3'd1;   // MLP L1
+            mmu_op_code  = 3'd1;
             mmu_stage    = 2'd0;
         end
         S_M_L2_COMPUTE: begin
             mmu_valid_in = 1'b1;
-            mmu_op_code  = 3'd1;   // MLP L2
+            mmu_op_code  = 3'd1;
             mmu_stage    = 2'd2;
         end
-        // MHA sub-operations mapped to op_code 3'd2
         S_H_COMPUTE_QKV: begin
             mmu_valid_in = 1'b1;
-            mmu_op_code  = 3'd2;   // MHA: linear projection
+            mmu_op_code  = 3'd2;
             mmu_stage    = 2'd0;
         end
         S_H_COMPUTE_ATTN: begin
             mmu_valid_in = 1'b1;
-            mmu_op_code  = 3'd3;   // MHA: attention QKᵀ
+            mmu_op_code  = 3'd3;
             mmu_stage    = 2'd0;
         end
         S_H_COMPUTE_SXV: begin
             mmu_valid_in = 1'b1;
-            mmu_op_code  = 3'd4;   // MHA: SxV
+            mmu_op_code  = 3'd4;
             mmu_stage    = 2'd0;
         end
         S_H_PROJ_COMPUTE: begin
             mmu_valid_in = 1'b1;
-            mmu_op_code  = 3'd2;   // MHA: W_proj linear
+            mmu_op_code  = 3'd2;
             mmu_stage    = 2'd1;
         end
         S_H_FFN1_COMPUTE: begin
             mmu_valid_in = 1'b1;
-            mmu_op_code  = 3'd5;   // FFN1 (pre-GELU)
+            mmu_op_code  = 3'd5;
             mmu_stage    = 2'd0;
         end
         S_H_FFN2_COMPUTE: begin
             mmu_valid_in = 1'b1;
-            mmu_op_code  = 3'd5;   // FFN2
+            mmu_op_code  = 3'd5;
             mmu_stage    = 2'd1;
         end
         default: ;
@@ -1598,76 +1591,41 @@ always_comb begin
 end
 
 // =============================================================================
-// Output buffer control outputs
+// Output buffer control (unchanged)
 // =============================================================================
 always_comb begin
     obuf_capture_en = 1'b0;
     obuf_rd_idx     = '0;
-
     case (state)
-        S_C_WAIT_OUT:        obuf_capture_en = 1'b1;
-        S_C_WRITEBACK:       obuf_rd_idx = c_wb_cnt;
-        S_M_L2_COMPUTE:      obuf_capture_en = (m_compute_cnt == M_N_ACC_L2);
-        S_M_WRITEBACK:       obuf_rd_idx = m_wb_cnt;
-
-        // MHA writeback states
-        S_H_COMPUTE_QKV:     obuf_capture_en = (h_compute_cnt == H_N_ACC_QKV);
-        S_H_WRITEBACK_QKV:   obuf_rd_idx = h_wb_cnt;
-
-        S_H_COMPUTE_ATTN:    obuf_capture_en = (h_compute_cnt == H_N_ACC_ATTN);
-        S_H_WRITEBACK_ATTN:  obuf_rd_idx = h_wb_cnt;
-
-        S_H_COMPUTE_SXV:     obuf_capture_en = (h_compute_cnt == H_N_ACC_SXV);
-        S_H_WRITEBACK_SXV:   obuf_rd_idx = h_wb_cnt;
-
-        S_H_PROJ_COMPUTE:    obuf_capture_en = (h_compute_cnt == H_N_ACC_PROJ);
-        S_H_PROJ_WRITEBACK:  obuf_rd_idx = h_wb_cnt;
-
-        S_H_FFN1_COMPUTE:    obuf_capture_en = (h_compute_cnt == H_N_ACC_FFN1);
-        S_H_FFN1_WRITEBACK:  obuf_rd_idx = h_wb_cnt;
-
-        S_H_FFN2_COMPUTE:    obuf_capture_en = (h_compute_cnt == H_N_ACC_FFN2);
-        S_H_FFN2_WRITEBACK:  obuf_rd_idx = h_wb_cnt;
-
+        S_C_WAIT_OUT:       obuf_capture_en = 1'b1;
+        S_C_WRITEBACK:      obuf_rd_idx = c_wb_cnt;
+        S_M_L2_COMPUTE:     obuf_capture_en = (m_compute_cnt == M_N_ACC_L2);
+        S_M_WRITEBACK:      obuf_rd_idx = m_wb_cnt;
+        S_H_COMPUTE_QKV:    obuf_capture_en = (h_compute_cnt == H_N_ACC_QKV);
+        S_H_WRITEBACK_QKV:  obuf_rd_idx = h_wb_cnt;
+        S_H_COMPUTE_ATTN:   obuf_capture_en = (h_compute_cnt == H_N_ACC_ATTN);
+        S_H_WRITEBACK_ATTN: obuf_rd_idx = h_wb_cnt;
+        S_H_COMPUTE_SXV:    obuf_capture_en = (h_compute_cnt == H_N_ACC_SXV);
+        S_H_WRITEBACK_SXV:  obuf_rd_idx = h_wb_cnt;
+        S_H_PROJ_COMPUTE:   obuf_capture_en = (h_compute_cnt == H_N_ACC_PROJ);
+        S_H_PROJ_WRITEBACK: obuf_rd_idx = h_wb_cnt;
+        S_H_FFN1_COMPUTE:   obuf_capture_en = (h_compute_cnt == H_N_ACC_FFN1);
+        S_H_FFN1_WRITEBACK: obuf_rd_idx = h_wb_cnt;
+        S_H_FFN2_COMPUTE:   obuf_capture_en = (h_compute_cnt == H_N_ACC_FFN2);
+        S_H_FFN2_WRITEBACK: obuf_rd_idx = h_wb_cnt;
         default: ;
     endcase
 end
 
 // =============================================================================
-// Shift Buffer control
-// =============================================================================
-// Drives three new outputs that the shift_buffer module consumes:
-//
-//   sb_op_start / sb_op_base_addr
-//     Asserted once per new top-level operation (Conv, MLP, MHA).
-//     Also asserted when MLP transitions from L1 to L2 (resets the pointer
-//     to the same MLP base so L2 reuses the same 448-entry shift table).
-//     Also asserted at each new MHA window boundary (same 7 749-entry table
-//     is reused for every window because weights — and therefore scaling
-//     factors — are constant across all 64 windows).
-//
-//   sb_advance
-//     Pulsed once per completed 7-element row-group for every operation.
-//     Causes the shift_buffer to present the next shift value to the
-//     rounding_shifter in time for the following row-group writeback.
-//
-//   Priority rule (enforced inside shift_buffer.sv):
-//     sb_op_start beats sb_advance on any cycle where both are asserted.
-//     The only case where this can happen is S_M_L1_NEXT_COL with
-//     m_last_l1_col (last L1 column): sb_advance fires for the last L1
-//     row-group while sb_op_start simultaneously resets for L2.
-//     The op_start wins — the pointer is placed at SB_MLP_BASE and the
-//     last L1 advance is discarded (irrelevant since L1 is done).
+// Shift buffer control (unchanged)
 // =============================================================================
 always_comb begin : shift_buf_ctrl
     sb_op_start     = 1'b0;
     sb_op_base_addr = '0;
     sb_advance      = 1'b0;
 
-    // ── sb_op_start ──────────────────────────────────────────────────────────
-
     if (state == S_IDLE && start) begin
-        // Arm the shift buffer at the very beginning of any operation.
         sb_op_start = 1'b1;
         case (mode)
             2'b00:   sb_op_base_addr = SB_AW'(SB_CONV_BASE);
@@ -1675,82 +1633,22 @@ always_comb begin : shift_buf_ctrl
             2'b10:   sb_op_base_addr = SB_AW'(SB_MHA_BASE);
             default: sb_op_base_addr = '0;
         endcase
-    end
-
-    // MLP Layer 2: reset read pointer back to MLP base so L2 reuses the
-    // same 448 shift values that were used for L1.
-    // Triggered at the last column of L1 (next state → S_M_L2_PRELOAD0).
-    else if (state == S_M_L1_NEXT_COL && m_last_l1_col) begin
+    end else if (state == S_M_L1_NEXT_COL && m_last_l1_col) begin
         sb_op_start     = 1'b1;
         sb_op_base_addr = SB_AW'(SB_MLP_BASE);
-    end
-
-    // MHA new window: each of the 64 windows uses the same weight matrices
-    // and therefore the same shift values.  Reset the pointer at the start
-    // of every new window so the 7 749-entry table is replayed identically.
-    else if (state == S_H_NEXT_WINDOW && !h_last_win) begin
+    end else if (state == S_H_NEXT_WINDOW && !h_last_win) begin
         sb_op_start     = 1'b1;
         sb_op_base_addr = SB_AW'(SB_MHA_BASE);
     end
 
-    // ── sb_advance ───────────────────────────────────────────────────────────
-    // One pulse per 7-element row-group completion for each operation.
-    // The shift_buffer increments its read pointer so the next shift value
-    // is already at the output before the following row-group's writeback.
-
-    // ── Convolution ──────────────────────────────────────────────────────────
-    // The same (kernel, row_group) shift value spans all 8 chunks
-    // (c_chunk_idx 0..7).  Advance only when the last chunk finishes,
-    // i.e. when c_last_chunk is true in S_C_NEXT.
-    // Total advances: 96 kernels × 56 output rows = 5 376.
-    if (state == S_C_NEXT && c_last_chunk)
-        sb_advance = 1'b1;
-
-    // ── MLP ──────────────────────────────────────────────────────────────────
-    // One shift value covers all output columns for one 7-row row-group.
-    // Advance once per row-group transition (S_M_NEXT_ROW).
-    // Total advances per layer: 448.  The pointer is reset to SB_MLP_BASE
-    // for L2 via the sb_op_start path above, so L2 replays the same 448
-    // entries.
-    if (state == S_M_NEXT_ROW)
-        sb_advance = 1'b1;
-
-    // ── MHA — QKV projection ─────────────────────────────────────────────────
-    // Each (patch_group, output_column) pair produces one 7-element vector.
-    // Advance at every S_H_NEXT_QKV_COL (fires 96 times per patch-group,
-    // 7 patch-groups, 3 matrices Q/K/V → 2 016 advances per window).
-    if (state == S_H_NEXT_QKV_COL)
-        sb_advance = 1'b1;
-
-    // ── MHA — Attention QKᵀ ──────────────────────────────────────────────────
-    // Each (row_group, attn_col) pair → one 7-element vector.
-    // Advances: 49 cols × 7 groups × 3 heads = 1 029.
-    if (state == S_H_NEXT_ATTN_COL)
-        sb_advance = 1'b1;
-
-    // ── MHA — SxV ────────────────────────────────────────────────────────────
-    // Each (row_group, sxv_col) pair → one 7-element vector.
-    // Advances: 32 cols × 7 groups × 3 heads = 672.
-    if (state == S_H_NEXT_SXV_COL)
-        sb_advance = 1'b1;
-
-    // ── MHA — W_proj ─────────────────────────────────────────────────────────
-    // Each (row_group, proj_col) pair → one 7-element vector.
-    // Advances: 96 cols × 7 groups = 672.
-    if (state == S_H_PROJ_NEXT_COL)
-        sb_advance = 1'b1;
-
-    // ── MHA — FFN1 ───────────────────────────────────────────────────────────
-    // Each (row_group, ffn1_col) pair → one 7-element vector.
-    // Advances: 384 cols × 7 groups = 2 688.
-    if (state == S_H_FFN1_NEXT_COL)
-        sb_advance = 1'b1;
-
-    // ── MHA — FFN2 ───────────────────────────────────────────────────────────
-    // Each (row_group, ffn2_col) pair → one 7-element vector.
-    // Advances: 96 cols × 7 groups = 672.
-    if (state == S_H_FFN2_NEXT_COL)
-        sb_advance = 1'b1;
+    if (state == S_C_NEXT && c_last_chunk)    sb_advance = 1'b1;
+    if (state == S_M_NEXT_ROW)                sb_advance = 1'b1;
+    if (state == S_H_NEXT_QKV_COL)            sb_advance = 1'b1;
+    if (state == S_H_NEXT_ATTN_COL)           sb_advance = 1'b1;
+    if (state == S_H_NEXT_SXV_COL)            sb_advance = 1'b1;
+    if (state == S_H_PROJ_NEXT_COL)           sb_advance = 1'b1;
+    if (state == S_H_FFN1_NEXT_COL)           sb_advance = 1'b1;
+    if (state == S_H_FFN2_NEXT_COL)           sb_advance = 1'b1;
 
 end : shift_buf_ctrl
 
