@@ -1,167 +1,110 @@
 // =============================================================================
-// shift_buffer.sv
+// shift_buffer.sv  (rev 2 — all 4 Swin stages supported)
 //
-// Per-row-group quantization shift-amount table for the rounding_shifter.
+// ── What changed from rev 1 ───────────────────────────────────────────────
+//   DEPTH: 16,384 → 131,072   (Stage 4 MHA dominant: see table below)
+//   AW:        14 → 17
+//   SB_MHA_BASE: 5,824 → 5,824  (unchanged — Conv + MLP slots are same)
+//   MHA region updated to cover Stage 4 window = 61,992 entries
 //
-// ── Purpose ──────────────────────────────────────────────────────────────────
-// The rounding_shifter (quantizer) needs a different shift_amt for every
-// group of 7 output elements that the MMU produces.  This module holds a
-// pre-loaded table of 8-bit signed shift values and presents the correct
-// value to the quantizer at all times.
+// ── Sizing table — all stages ─────────────────────────────────────────────
 //
-// ── How it works ─────────────────────────────────────────────────────────────
-//  1. Before an operation begins, the CPU/DMA writes the required shift values
-//     into the internal RAM through the cpu_wr_* port (32-bit bus → 4 shift
-//     values packed per word).
-//  2. The unified_controller asserts sb_op_start once at the start of each
-//     operation (or sub-operation boundary) and supplies the entry base address
-//     sb_op_base_addr.  The read pointer is immediately reset to that address.
-//  3. After each 7-element row-group writeback, the controller asserts
-//     sb_advance for one cycle.  The read pointer increments by one, selecting
-//     the next 8-bit shift value for the following row-group.
-//  4. shift_amt is combinatorially decoded from the current read pointer;
-//     it is stable throughout the entire 7-element writeback.
-//
-// ── Memory layout (default DEPTH = 16 384 entries) ───────────────────────────
-//   Region        Base      Size      Calculation
+//   Region              Base    Size      Derivation
 //   ─────────────────────────────────────────────────────────────────────────
-//   Conv          0         5 376     96 kernels × 56 output rows
-//   MLP           5 376       448     448 row-groups (3 136 rows / 7)
-//                                     Same table reused by L1 and L2
-//   MHA / window  5 824     7 749     All sub-operations per 7×7 window
-//     QKV  (Q+K+V)          2 016     96 cols × 7 patch-groups × 3 matrices
-//     Attention (QKᵀ)       1 029     49 cols × 7 row-groups   × 3 heads
-//     SxV                     672     32 cols × 7 row-groups   × 3 heads
-//     W_proj                  672     96 cols × 7 row-groups
-//     FFN1                  2 688     384 cols × 7 row-groups
-//     FFN2                    672     96 cols × 7 row-groups
+//   Conv                   0    5,376     96 kernels × 56 output rows
+//   MLP (all PM stages) 5,376     448     max row-groups = 3136/7 = 448
+//                                         (same 448-entry table reused for L1+L2)
+//   MHA / window         5,824  61,992    Stage 4 per-window (dominant):
+//     QKV (3 mats)              16,128    768 cols × 7 groups × 3
+//     Attention (24 hd)          8,232     49 cols × 7 groups × 24
+//     SxV (24 hd)                5,376     32 cols × 7 groups × 24
+//     W_proj                     5,376    768 cols × 7 groups
+//     FFN1                      21,504   3072 cols × 7 groups
+//     FFN2                       5,376    768 cols × 7 groups
 //   ─────────────────────────────────────────────────────────────────────────
-//   Total used: 13 573 entries  ≤  DEPTH = 16 384  ✓
+//   Total used: 5,376 + 448 + 61,992 = 67,816 entries
+//   DEPTH = 131,072  (next power of 2 ≥ 67,816)
+//   AW = 17  (2^17 = 131,072)
 //
-//   The MHA sub-operations are laid out contiguously at SB_MHA_BASE.
-//   The controller advances the pointer through all 7 749 entries in one
-//   window pass, then resets back to SB_MHA_BASE for the next window
-//   (same weights → same shift values for every window).
+//   Note: Stages 1–3 use fewer MHA entries (smaller C / fewer heads) but
+//   they fit within the same 61,992-slot region.  The controller writes only
+//   the relevant portion before each round; unused slots are never addressed.
 //
-// ── CPU write bus format ─────────────────────────────────────────────────────
-//   The 32-bit bus packs four 8-bit shift values per word:
-//     bits [7:0]   → entry N+0
-//     bits [15:8]  → entry N+1
-//     bits [23:16] → entry N+2
-//     bits [31:24] → entry N+3
-//   cpu_wr_addr is a WORD address (entry_address >> 2).
-//   Example: to write shift values for entries 8..11 supply cpu_wr_addr = 2.
+//   Stage-specific MHA entry counts per window:
+//     Stage1 (C=96,  h=3):   QKV=2016, ATTN=1029, SxV=672, PROJ=672, FFN1=2688, FFN2=672  = 7749
+//     Stage2 (C=192, h=6):   QKV=4032, ATTN=2058, SxV=1344,PROJ=1344,FFN1=5376, FFN2=1344 = 15498
+//     Stage3 (C=384, h=12):  QKV=8064, ATTN=4116, SxV=2688,PROJ=2688,FFN1=10752,FFN2=2688 = 30996
+//     Stage4 (C=768, h=24):  QKV=16128,ATTN=8232,SxV=5376,PROJ=5376,FFN1=21504,FFN2=5376 = 61992
 //
-// ── Priority ─────────────────────────────────────────────────────────────────
-//   sb_op_start   >  sb_advance
-//   (op_start resets the pointer; simultaneous advance is absorbed)
+// ── CPU write bus format (unchanged) ─────────────────────────────────────
+//   32-bit word packs 4 shift values; cpu_wr_addr is a word address (entry >> 2).
 //
+// ── Priority (unchanged) ──────────────────────────────────────────────────
+//   sb_op_start > sb_advance (op_start absorbs simultaneous advance)
 // =============================================================================
 
 module shift_buffer #(
-    parameter int DEPTH = 16384,           // total 8-bit shift entries storable
-    parameter int AW    = $clog2(DEPTH),   // entry address width  (14 for DEPTH=16384)
-    parameter int DW    = 8                // shift value width; must match rounding_shifter W_SHIFT
+    parameter int DEPTH = 131072,          // total 8-bit shift entries storable
+    parameter int AW    = $clog2(DEPTH),   // 17 for DEPTH=131072
+    parameter int DW    = 8                // shift value width
 )(
     input  logic          clk,
     input  logic          rst_n,
 
-    // ── CPU / DMA write port (32-bit bus, 4 entries per word) ────────────────
-    // cpu_wr_addr  : word address = desired_entry_addr >> 2  (AW-2 bits wide)
-    // cpu_wr_data  : four packed DW-bit shift values (LSB-first byte order)
-    // cpu_wr_en    : write-enable strobe (one cycle)
-    input  logic [AW-3:0] cpu_wr_addr,    // 12-bit word address for DEPTH=16384
+    // ── CPU / DMA write port ─────────────────────────────────────────────
+    input  logic [AW-3:0] cpu_wr_addr,    // word address = entry_addr >> 2
     input  logic [31:0]   cpu_wr_data,
     input  logic          cpu_wr_en,
 
-    // ── Controller interface ──────────────────────────────────────────────────
-    // sb_op_start     : one-cycle pulse at the start of each operation or
-    //                   each MHA window.  Resets the read pointer to
-    //                   sb_op_base_addr on the same rising edge.
-    // sb_op_base_addr : entry (byte) address of the first shift value for
-    //                   this operation.  Sampled only when sb_op_start is high.
-    // sb_advance      : one-cycle pulse after each 7-element row-group
-    //                   writeback is complete.  Increments the read pointer
-    //                   by 1 so the next shift value is ready immediately.
+    // ── Controller interface ─────────────────────────────────────────────
     input  logic           sb_op_start,
     input  logic [AW-1:0]  sb_op_base_addr,
     input  logic           sb_advance,
 
-    // ── Output to rounding_shifter ────────────────────────────────────────────
-    // Combinatorial; stable for the entire duration of a 7-element writeback.
-    // Remains valid one cycle after the last sb_advance (the pointer has
-    // already moved to the next position).
+    // ── Output to rounding_shifter ───────────────────────────────────────
     output logic signed [DW-1:0] shift_amt
 );
 
-// ---------------------------------------------------------------------------
-// Derived constants
-// ---------------------------------------------------------------------------
-localparam int RAM_DEPTH = DEPTH / 4;   // 4096 words for DEPTH=16384
-localparam int RAM_AW    = AW - 2;      // 12-bit word address for DEPTH=16384
+    // ── Internal byte-addressable RAM ─────────────────────────────────────
+    // Stored as 32-bit words; each word holds 4 DW-bit shift values.
+    localparam int WORD_DEPTH = DEPTH / 4;  // 32768 words
 
-// ---------------------------------------------------------------------------
-// Internal RAM  (synchronous write, asynchronous read)
-// ---------------------------------------------------------------------------
-(* ram_style = "auto" *)
-logic [31:0] mem [0:RAM_DEPTH-1];
+    logic [31:0] mem [0:WORD_DEPTH-1];
 
-// Simulation initialisation — synthesis ignores initial blocks.
-`ifdef SIMULATION
-initial begin
-    for (int i = 0; i < RAM_DEPTH; i++) mem[i] = 32'h0;
-end
-`endif
-
-// ---------------------------------------------------------------------------
-// Read pointer  (entry address)
-// ---------------------------------------------------------------------------
-logic [AW-1:0] rd_ptr;
-
-// ---------------------------------------------------------------------------
-// CPU write  (synchronous, word-granular)
-// ---------------------------------------------------------------------------
-always_ff @(posedge clk) begin
-    if (cpu_wr_en)
-        mem[cpu_wr_addr] <= cpu_wr_data;
-end
-
-// ---------------------------------------------------------------------------
-// Pointer control
-//   Priority:  sb_op_start  >  sb_advance
-// ---------------------------------------------------------------------------
-always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        rd_ptr <= '0;
-    end else if (sb_op_start) begin
-        // Reset to the base address of the new operation.
-        // Any simultaneous sb_advance is silently absorbed.
-        rd_ptr <= sb_op_base_addr;
-    end else if (sb_advance) begin
-        // Step to the next shift value for the next 7-element row-group.
-        rd_ptr <= rd_ptr + 1'b1;
+    initial begin
+        for (int i = 0; i < WORD_DEPTH; i++) mem[i] = '0;
     end
-end
 
-// ---------------------------------------------------------------------------
-// Output decode  (fully combinatorial — zero extra latency)
-//
-//   rd_ptr[AW-1 : 2]  →  selects the 32-bit RAM word
-//   rd_ptr[1:0]        →  selects which 8-bit byte within that word
-// ---------------------------------------------------------------------------
-logic [31:0] rd_word;
-logic [1:0]  byte_sel;
+    always_ff @(posedge clk) begin
+        if (cpu_wr_en)
+            mem[cpu_wr_addr] <= cpu_wr_data;
+    end
 
-assign rd_word  = mem[rd_ptr[AW-1:2]];
-assign byte_sel = rd_ptr[1:0];
+    // ── Read pointer (entry address, byte-granular) ───────────────────────
+    logic [AW-1:0] rd_ptr;
 
-always_comb begin
-    unique case (byte_sel)
-        2'b00: shift_amt = signed'(rd_word[ 7: 0]);
-        2'b01: shift_amt = signed'(rd_word[15: 8]);
-        2'b10: shift_amt = signed'(rd_word[23:16]);
-        2'b11: shift_amt = signed'(rd_word[31:24]);
-    endcase
-end
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rd_ptr <= '0;
+        end else if (sb_op_start) begin
+            // op_start wins over advance
+            rd_ptr <= sb_op_base_addr;
+        end else if (sb_advance) begin
+            rd_ptr <= rd_ptr + AW'(1);
+        end
+    end
+
+    // ── Combinatorial read-out ────────────────────────────────────────────
+    // Word address = rd_ptr[AW-1:2]; byte lane = rd_ptr[1:0]
+    always_comb begin
+        automatic logic [31:0] word = mem[rd_ptr[AW-1:2]];
+        case (rd_ptr[1:0])
+            2'd0: shift_amt = signed'(word[ 7: 0]);
+            2'd1: shift_amt = signed'(word[15: 8]);
+            2'd2: shift_amt = signed'(word[23:16]);
+            2'd3: shift_amt = signed'(word[31:24]);
+            default: shift_amt = '0;
+        endcase
+    end
 
 endmodule

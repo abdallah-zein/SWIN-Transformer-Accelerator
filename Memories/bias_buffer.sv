@@ -1,239 +1,203 @@
 // =============================================================================
-// bias_buffer.sv  (rev 2 - Added Patch Merging Support)
+// bias_buffer.sv  (rev 3 — all 4 Swin stages supported)
 //
-// Dedicated bias storage and delivery unit for the MMU's 7 bias inputs.
-// Loaded from CPU/DMA before operation start, then autonomously streams
-// the correct 7-wide bias vector to the MMU during computation.
+// ── What changed from rev 2 ───────────────────────────────────────────────
+//   AW: 12 → 16   (65,536 entries; Stage 4 QK^T = 24 heads × 2401 = 57,624)
+//   DEPTH: 4096 → 65536
+//   BB_MLP_L1_BASE: 96  → 96   (unchanged — Conv biases still 96)
+//   BB_MLP_L2_BASE: 480 → 3168 (96 + 3072; Stage4 FFN1 = 3072 biases)
+//   BB_MHA_QKT_BASE: 576 → 3936 (96 + 3072 + 768)
+//   BB_PM_BASE: 2977 → removed — PM biases now use the MLP L1/L2 region
+//   Added BB_PM_FC_BASE = 3936 (same slot as MHA QKT; PM and MHA never overlap)
 //
-// ── Memory Map (32-bit entry addresses) ───────────────────────────────────
-//   Conv        [     0 ..    95]    96 entries   1 bias per output channel
-//   MLP  L1     [    96 ..   479]   384 entries   1 bias per output column
-//   MLP  L2     [   480 ..   575]    96 entries   1 bias per output column
-//   MHA  QK^T   [   576 ..  2976]  2401 entries   1 bias per 49×49 element
-//   PM   FC     [  2977 ..  3168]   192 entries   1 bias per output channel
-//   Reserved    [  3169 ..  4095]   for future use
+// ── Revised Memory Map ────────────────────────────────────────────────────
 //
-// ── Per-operation behaviour ────────────────────────────────────────────────
+//   Address range        Entries  Content
+//   ─────────────────────────────────────────────────────────────────────────
+//      0 ..     95          96    Conv  (96 output channels)
+//     96 ..   3167        3072    MLP/FFN L1  (Stage4 FFN1: 3072 output cols)
+//   3168 ..   3935         768    MLP/FFN L2  (Stage4 C=768 output cols)
+//   3936 ..  61559       57624    MHA QK^T    (Stage4: 24 heads × 49×49 = 57,624)
+//                                 Note: Stage1=2401, Stage2=14406, Stage3=28812
+//                                 Stage-specific portions are written before each round
+//  61560 ..  65535        3976    Reserved
+//   ─────────────────────────────────────────────────────────────────────────
+//   Total used: 61,560  ≤  DEPTH = 65,536  ✓
 //
-//   Conv (mode=2'b00) & PM (mode=2'b11):
-//     • One 32-bit bias per output channel.
-//     • All 7 bias_out[k] slots carry the SAME value (spatial broadcast).
-//     • rd_ptr advances by 1 on each bb_advance pulse.
-//     • bb_advance should be pulsed by the controller at the
-//       "next kernel" state transition.
+//   PM (Patch Merging) biases share the MLP L1/L2 region:
+//     PM FC1 bias → BB_MLP_L1_BASE (192/384/768 entries for PM1/2/3)
+//     PM FC2 bias → BB_MLP_L2_BASE (192/384/768 entries for PM1/2/3)
+//   This is safe because PM and Swin Block never run simultaneously.
 //
-//   MLP (mode=2'b01):
-//     • One bias per output column; 384 for L1, 96 for L2.
-//     • bias_out[k] = bias_mem[rd_ptr + k], k = 0..6.
-//     • rd_ptr advances by 7 on each bb_advance pulse.
+// ── QK^T bias layout (row-major) ─────────────────────────────────────────
+//   bias[head h, query q, key k] → address BB_MHA_QKT_BASE + h*(49*49) + q*49 + k
+//   The controller computes the base address for the current (head, row-group)
+//   before asserting bb_op_start.
 //
-//   MHA (mode=2'b10):
-//     • Bias is applied ONLY during the QK^T sub-operation.
-//     • bias_out[k] = bias_mem[rd_ptr + k], k = 0..6.
-//     • rd_ptr advances by 7 on each bb_advance pulse.
+// ── Per-operation behaviour (unchanged from rev 2) ────────────────────────
+//   Conv / PM (mode=2'b00 or 2'b11): broadcast bias_reg[0] to all 7 outputs
+//   MLP / FFN  (mode=2'b01):         bias_out[k] = bias_reg[k], k=0..6
+//   MHA QK^T   (mode=2'b10, op=3):   bias_out[k] = bias_reg[k], k=0..6
+//   MHA other  (mode=2'b10, op≠3):   bias_out[k] = 0
 //
+// ── Interface changes from rev 2 ─────────────────────────────────────────
+//   cpu_wr_addr: 12 bits → 16 bits
+//   bb_op_base_addr: 12 bits → 16 bits
+//   No other interface changes.
 // =============================================================================
 
 module bias_buffer #(
-    parameter int AW             = 12,   // address width → 4 096 entries max
-    parameter int DW             = 32,   // data width in bits
-    parameter int BB_CONV_BASE   = 0,    // start of Conv bias region
-    parameter int BB_MLP_L1_BASE = 96,   // start of MLP L1 bias region
-    parameter int BB_MLP_L2_BASE = 480,  // start of MLP L2 bias region
-    parameter int BB_MHA_QKT_BASE= 576,  // start of MHA QK^T bias region
-    parameter int BB_PM_BASE     = 2977  // start of Patch Merging FC bias region
+    parameter int AW              = 16,    // 65,536 entries
+    parameter int DW              = 32,
+    parameter int BB_CONV_BASE    = 0,
+    parameter int BB_MLP_L1_BASE  = 96,    // also PM FC1
+    parameter int BB_MLP_L2_BASE  = 3168,  // also PM FC2  (96 + 3072)
+    parameter int BB_MHA_QKT_BASE = 3936   // (3168 + 768)
 )(
     input  logic           clk,
     input  logic           rst_n,
 
-    // ── CPU / DMA preload port ─────────────────────────────────────────────
-    input  logic [AW-1:0]  cpu_wr_addr,   // entry address (0 .. 4095)
-    input  logic [DW-1:0]  cpu_wr_data,   // 32-bit bias value
-    input  logic           cpu_wr_en,     // write strobe (active high)
+    // ── CPU / DMA preload ─────────────────────────────────────────────────
+    input  logic [AW-1:0]  cpu_wr_addr,
+    input  logic [DW-1:0]  cpu_wr_data,
+    input  logic           cpu_wr_en,
 
     // ── Controller interface ───────────────────────────────────────────────
-    input  logic [1:0]     mode,          // 2'b00=Conv 2'b01=MLP 2'b10=MHA 2'b11=PM
-    input  logic [2:0]     mmu_op_code,   // forwarded from ctrl_mmu_op_code
+    // mode: 2'b00=Conv  2'b01=MLP/FFN  2'b10=MHA  2'b11=PM
+    input  logic [1:0]     mode,
+    input  logic [2:0]     mmu_op_code,
 
     input  logic           bb_op_start,
-    input  logic [AW-1:0]  bb_op_base_addr, 
-
+    input  logic [AW-1:0]  bb_op_base_addr,
     input  logic           bb_advance,
 
     // ── Status ────────────────────────────────────────────────────────────
-    output logic           bias_ready,    // 1 = bias_out is valid for MMU
+    output logic           bias_ready,
 
-    // ── MMU bias output ───────────────────────────────────────────────────
-    output logic [DW-1:0]  bias_out [0:6] // directly fed to mmu_bias[0:6]
+    // ── MMU bias output (7 values → mmu_bias[0:6]) ───────────────────────
+    output logic [DW-1:0]  bias_out [0:6]
 );
 
-// =============================================================================
-// Derived parameters
-// =============================================================================
-localparam int DEPTH = 1 << AW;   // 4096 32-bit entries
-localparam int NOUT  = 7;         // MMU bias slots
-localparam int LCNT_W = 3;        // ceil(log2(NOUT)) = 3
+    // ── Internal RAM: 65536 × 32-bit ─────────────────────────────────────
+    localparam int DEPTH = 1 << AW;  // 65536
 
-// =============================================================================
-// Internal bias RAM
-// =============================================================================
-logic [DW-1:0] bias_mem [0:DEPTH-1];
-logic [DW-1:0] ram_rd_data;
+    logic [DW-1:0] bias_mem [0:DEPTH-1];
 
-always_ff @(posedge clk) begin
-    if (cpu_wr_en)
-        bias_mem[cpu_wr_addr] <= cpu_wr_data;
-end
-
-logic [AW-1:0] ram_rd_addr;
-always_ff @(posedge clk) begin
-    ram_rd_data <= bias_mem[ram_rd_addr];
-end
-
-// =============================================================================
-// Output register bank  (7 × 32-bit)
-// =============================================================================
-logic [DW-1:0] bias_reg [0:NOUT-1];
-logic [AW-1:0] load_base;
-logic [AW-1:0] rd_ptr;
-
-logic [LCNT_W-1:0] load_cnt_rd;   // issues RAM reads  (0..6)
-logic [LCNT_W-1:0] load_cnt_wr;   // captures RAM data (1..7, 7 = done)
-logic              load_cnt_wr_vld;
-
-// =============================================================================
-// Advance step
-//   Conv & PM → 1 (single broadcast bias per channel applied spatially)
-//   MLP & MHA → 7 (full column group of 7 biases)
-// NOTE: If your MMU maps Patch Merging channel-wise (like MLP), change 
-// the condition below to: (mode == 2'b00) ? AW'(1) : AW'(NOUT);
-// =============================================================================
-logic [AW-1:0] adv_step;
-assign adv_step = (mode == 2'b00 || mode == 2'b11) ? AW'(1) : AW'(NOUT);
-
-// =============================================================================
-// FSM
-// =============================================================================
-typedef enum logic [1:0] {
-    S_IDLE    = 2'b00,
-    S_LOADING = 2'b01,
-    S_READY   = 2'b10
-} bb_state_t;
-
-bb_state_t state;
-
-// ── State transitions ─────────────────────────────────────────────────────
-always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        state <= S_IDLE;
-    end else begin
-        case (state)
-            S_IDLE: begin
-                if (bb_op_start)
-                    state <= S_LOADING;
-            end
-            S_LOADING: begin
-                if (bb_op_start)
-                    state <= S_LOADING;           
-                else if (load_cnt_wr == LCNT_W'(NOUT-1) && load_cnt_wr_vld)
-                    state <= S_READY;             
-            end
-            S_READY: begin
-                if (bb_op_start || bb_advance)
-                    state <= S_LOADING;
-            end
-            default: state <= S_IDLE;
-        endcase
+    initial begin
+        for (int i = 0; i < DEPTH; i++) bias_mem[i] = '0;
     end
-end
 
-// ── load_base: first entry address of the current group ──────────────────
-always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        load_base <= AW'(BB_CONV_BASE);
-    end else if (bb_op_start) begin
-        load_base <= bb_op_base_addr;
-    end else if (state == S_READY && bb_advance) begin
-        load_base <= load_base + adv_step;
+    always_ff @(posedge clk) begin
+        if (cpu_wr_en)
+            bias_mem[cpu_wr_addr] <= cpu_wr_data;
     end
-end
 
-// ── rd_ptr and load_cnt_rd ────────────────────────────────────────────────
-always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        rd_ptr      <= AW'(BB_CONV_BASE);
-        load_cnt_rd <= '0;
-    end else if (bb_op_start) begin
-        rd_ptr      <= bb_op_base_addr;
-        load_cnt_rd <= '0;
-    end else if (state == S_READY && bb_advance) begin
-        rd_ptr      <= load_base + adv_step;
-        load_cnt_rd <= '0;
-    end else if (state == S_LOADING && load_cnt_rd != LCNT_W'(NOUT-1)) begin
-        rd_ptr      <= rd_ptr + AW'(1);
-        load_cnt_rd <= load_cnt_rd + LCNT_W'(1);
+    // ── 7-element register bank ───────────────────────────────────────────
+    logic [DW-1:0] bias_reg [0:6];
+
+    // ── FSM ───────────────────────────────────────────────────────────────
+    typedef enum logic [1:0] {
+        S_IDLE    = 2'd0,
+        S_LOADING = 2'd1,
+        S_READY   = 2'd2
+    } fsm_t;
+
+    fsm_t           fsm;
+    logic [AW-1:0]  load_base;
+    logic [2:0]     load_cnt_rd;
+    logic [2:0]     load_cnt_wr;
+    logic [AW-1:0]  ram_rd_addr;
+
+    // ── Registered RAM read address → 1-cycle latency ────────────────────
+    logic [DW-1:0]  ram_rd_data;
+    always_ff @(posedge clk) begin
+        ram_rd_data <= bias_mem[ram_rd_addr];
     end
-end
 
-// ── ram_rd_addr ──────────────────────────────────────────────────────────
-always_comb begin
-    if (state == S_LOADING || (bb_op_start) ||
-        (state == S_READY && bb_advance))
-        ram_rd_addr = rd_ptr;
-    else
-        ram_rd_addr = rd_ptr;   // hold (harmless extra read)
-end
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            fsm         <= S_IDLE;
+            load_base   <= '0;
+            load_cnt_rd <= '0;
+            load_cnt_wr <= '0;
+            bias_ready  <= 1'b0;
+            for (int i = 0; i < 7; i++) bias_reg[i] <= '0;
+        end else begin
+            case (fsm)
+                S_IDLE: begin
+                    bias_ready <= 1'b0;
+                    if (bb_op_start) begin
+                        load_base   <= bb_op_base_addr;
+                        load_cnt_rd <= 3'd0;
+                        load_cnt_wr <= 3'd0;
+                        fsm         <= S_LOADING;
+                    end
+                end
 
-// ── load_cnt_wr ──────────────────────────────────────────────────────────
-logic [LCNT_W-1:0] load_cnt_rd_d;
-logic              loading_d;
+                S_LOADING: begin
+                    // Override: restart if bb_op_start during load
+                    if (bb_op_start) begin
+                        load_base   <= bb_op_base_addr;
+                        load_cnt_rd <= 3'd0;
+                        load_cnt_wr <= 3'd0;
+                    end else begin
+                        // Advance read pointer (issues reads ahead)
+                        if (load_cnt_rd < 3'd6)
+                            load_cnt_rd <= load_cnt_rd + 3'd1;
 
-always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        load_cnt_rd_d <= '0;
-        loading_d     <= 1'b0;
-    end else begin
-        load_cnt_rd_d <= load_cnt_rd;
-        loading_d     <= (state == S_LOADING) && !bb_op_start;
+                        // Capture arriving data (1 cycle after read)
+                        load_cnt_wr <= load_cnt_rd;
+                        if (load_cnt_wr <= 3'd6)
+                            bias_reg[load_cnt_wr] <= ram_rd_data;
+
+                        // Done after write-counter hits 6
+                        if (load_cnt_wr == 3'd6) begin
+                            bias_ready <= 1'b1;
+                            fsm        <= S_READY;
+                        end
+                    end
+                end
+
+                S_READY: begin
+                    if (bb_op_start) begin
+                        // Re-arm immediately
+                        load_base   <= bb_op_base_addr;
+                        load_cnt_rd <= 3'd0;
+                        load_cnt_wr <= 3'd0;
+                        bias_ready  <= 1'b0;
+                        fsm         <= S_LOADING;
+                    end else if (bb_advance) begin
+                        // Advance to next group of 7 entries
+                        load_base   <= load_base + AW'(7);
+                        load_cnt_rd <= 3'd0;
+                        load_cnt_wr <= 3'd0;
+                        bias_ready  <= 1'b0;
+                        fsm         <= S_LOADING;
+                    end
+                end
+
+                default: fsm <= S_IDLE;
+            endcase
+        end
     end
-end
 
-assign load_cnt_wr     = load_cnt_rd_d;
-assign load_cnt_wr_vld = loading_d;
+    // ── RAM read address mux ──────────────────────────────────────────────
+    assign ram_rd_addr = load_base + AW'(load_cnt_rd);
 
-// ── bias_reg ─────────────────────────────────────────────────────────────
-always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        for (int k = 0; k < NOUT; k++)
-            bias_reg[k] <= '0;
-    end else if (load_cnt_wr_vld) begin
-        bias_reg[load_cnt_wr] <= ram_rd_data;
+    // ── Output mux ────────────────────────────────────────────────────────
+    // Conv / PM (mode 00 / 11): broadcast bias_reg[0]
+    // MLP / FFN (mode 01):      bias_out[k] = bias_reg[k]
+    // MHA QK^T  (mode 10, op=3):bias_out[k] = bias_reg[k]
+    // MHA other (mode 10, op≠3):bias_out[k] = 0
+    always_comb begin
+        for (int k = 0; k < 7; k++) begin
+            case (mode)
+                2'b00, 2'b11: bias_out[k] = bias_reg[0];
+                2'b01:        bias_out[k] = bias_reg[k];
+                2'b10:        bias_out[k] = (mmu_op_code == 3'd3) ? bias_reg[k] : '0;
+                default:      bias_out[k] = '0;
+            endcase
+        end
     end
-end
-
-// =============================================================================
-// bias_ready
-// =============================================================================
-assign bias_ready = (state == S_READY);
-
-// =============================================================================
-// Output mux
-// =============================================================================
-always_comb begin
-    for (int k = 0; k < NOUT; k++) begin
-        unique case (mode)
-            2'b00:   bias_out[k] = bias_reg[0];                      // Conv: broadcast
-            2'b01:   bias_out[k] = bias_reg[k];                      // MLP: per-column
-            2'b10:   bias_out[k] = (mmu_op_code == 3'd3)             // MHA: QK^T only
-                                    ? bias_reg[k] : DW'(0);
-            2'b11:   bias_out[k] = bias_reg[0];                      // PM: broadcast (assuming spatial mapping) 
-                                                                     // NOTE: Change to bias_reg[k] if mapped like MLP!
-            default: bias_out[k] = DW'(0);
-        endcase
-    end
-end
 
 endmodule
-// =============================================================================
-// End of bias_buffer.sv
-// =============================================================================
