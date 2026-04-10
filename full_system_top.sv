@@ -1,68 +1,54 @@
 // =============================================================================
-// full_system_top.sv  (rev 8 — MHA ILB raw-write bypass)
+// full_system_top.sv  (rev 9 — Bias Buffer integration)
 //
-// ── What changed from rev 7 ───────────────────────────────────────────────
-//   1. New wire: obuf_raw_rd_data [31:0]
-//      output_buffer now exposes raw_rd_data (= buf[rd_idx]) in addition to
-//      the existing rd_data that feeds the post-proc pipeline.  The raw wire
-//      bypasses the quantiser → ReLU → post_proc_mux chain entirely.
+// ── What changed from rev 8 ───────────────────────────────────────────────
 //
-//   2. New wire: ctrl_ilb_wr_bypass
-//      Asserted whenever mode == 2'b10 (MHA).  Passed to output_memory as
-//      ilb_wr_bypass, selecting ilb_raw_wr_data instead of post_proc_data as
-//      the write source.  All MHA intermediate results (Q, K, V, S, A, PROJ,
-//      FFN1, FFN2) are stored raw; the post-proc pipeline remains active only
-//      for Conv and MLP final outputs.
-//
-//   3. output_buffer instantiation gains: .raw_rd_data (obuf_raw_rd_data)
-//
-//   4. output_memory instantiation gains:
-//        .ilb_raw_wr_data (obuf_raw_rd_data)
-//        .ilb_wr_bypass   (ctrl_ilb_wr_bypass)
-//
-// ── (rev 7 notes preserved below) ────────────────────────────────────────
-//   1. Removed:  input logic signed [7:0] quant_shift_amt
-//      The per-element quantization shift amount is now driven entirely by the
-//      new shift_buffer (u_sbuf) rather than a single static value from the
-//      CPU.  The rounding_shifter receives shift_amt from u_sbuf.
-//
-//   2. Added three new top-level CPU/DMA write ports for the shift_buffer:
-//        cpu_sbuf_wr_addr [11:0]  — word address  (= entry_addr >> 2)
-//        cpu_sbuf_wr_data [31:0]  — four packed 8-bit shift values
-//        cpu_sbuf_wr_en           — write-enable strobe
-//      The CPU must preload the shift table corresponding to the intended
+//   1. New top-level CPU/DMA write ports for the bias_buffer:
+//        cpu_bbuf_wr_addr [11:0]  — entry address   (0 .. 4095)
+//        cpu_bbuf_wr_data [31:0]  — 32-bit bias value
+//        cpu_bbuf_wr_en           — write-enable strobe
+//      The CPU must preload all required bias values for the intended
 //      operation BEFORE asserting start.
 //
-//   3. The unified_controller gains three new outputs (see
-//      unified_controller_sb_additions.sv for the patch):
-//        sb_op_start      — resets shift_buffer read pointer to sb_op_base_addr
-//        sb_op_base_addr  — 14-bit entry base address for the current operation
-//        sb_advance       — step to next shift value after each 7-row group
+//   2. New controller wires (driven by unified_controller):
+//        ctrl_bb_op_start         — arm/re-arm pulse for bias_buffer
+//        ctrl_bb_op_base_addr     — base entry address for current op
+//        ctrl_bb_advance          — step to next 7-element bias group
 //
-//   4. shift_buffer u_sbuf is instantiated between the controller and the
-//      rounding_shifter.  DEPTH = 16 384, DW = 8, RAM_AW = 12.
+//   3. mmu_bias_bus width changed: [0:11] → [0:6]
+//      This matches the updated mmu.sv (rev 2) and mmu_top.sv (rev 2).
 //
-// ── Shift buffer memory map (for CPU preload) ─────────────────────────────
-//   All addresses below are 8-bit entry addresses.
-//   Divide by 4 to get the cpu_sbuf_wr_addr word address.
+//   4. mmu_bias_bus wiring changed:
+//        OLD: driven by unified_weight_buf.bias_out (scalar broadcast)
+//        NEW: driven by bias_buffer.bias_out[0:6] (per-column)
+//      The old mmu_bias_bus assignment that set [p]==0 for p>0 is removed.
 //
-//   Conv         entries [    0 ..  5375]  96 kernels × 56 output rows
-//   MLP          entries [ 5376 ..  5823]  448 row-groups (shared L1 & L2)
-//   MHA/window   entries [ 5824 .. 13572]  7 749 per window:
-//     QKV                                    2 016  (96 cols × 7 grp × 3 mat)
-//     Attention (QKᵀ)                        1 029  (49 cols × 7 grp × 3 head)
-//     SxV                                      672  (32 cols × 7 grp × 3 head)
-//     W_proj                                   672  (96 cols × 7 grp)
-//     FFN1                                   2 688  (384 cols × 7 grp)
-//     FFN2                                     672  (96 cols × 7 grp)
+//   5. unified_weight_buf.bias_out (ubuf_bias_out) retained as a wire but
+//      no longer connected to mmu_bias_bus.  It can be removed in a future
+//      revision once unified_weight_buf is updated to strip the bias path.
 //
-// ── CPU preload sequence ──────────────────────────────────────────────────
-//   (a) Set mode to the intended operation.
-//   (b) Write shift values to cpu_sbuf_wr_addr/data/en.
-//       Pack four consecutive 8-bit shift values into each 32-bit word.
-//       Entry N occupies bits [(N%4)*8 +: 8] of word N/4.
-//   (c) Assert start.  The controller fires sb_op_start on the same cycle,
-//       arming the shift_buffer at the correct base address.
+//   6. New instance: bias_buffer u_bbuf
+//        Parameters: AW=12, DW=32 with the standard memory-map constants.
+//
+//   7. unified_controller instantiation gains three new outputs:
+//        .bb_op_start      (ctrl_bb_op_start)
+//        .bb_op_base_addr  (ctrl_bb_op_base_addr)
+//        .bb_advance       (ctrl_bb_advance)
+//
+//   8. bias_ready from u_bbuf is an internal wire.  The controller must
+//      check this before asserting mmu_valid_in (implementation detail
+//      inside unified_controller; not exposed as a top-level port).
+//
+// ── CPU preload sequence (bias) ───────────────────────────────────────────
+//   (a) Choose the intended operation (mode).
+//   (b) Write bias values via cpu_bbuf_wr_addr / cpu_bbuf_wr_data / cpu_bbuf_wr_en.
+//       Memory map:
+//         Conv       entries [    0 ..   95]   96 × 32-bit (one per output channel)
+//         MLP L1     entries [   96 ..  479]  384 × 32-bit (one per output column)
+//         MLP L2     entries [  480 ..  575]   96 × 32-bit (one per output column)
+//         MHA QK^T   entries [  576 .. 2976] 2401 × 32-bit (row-major, 49×49)
+//   (c) Assert start.  The controller fires bb_op_start on the same cycle,
+//       arming the bias_buffer at the correct base address.
 //
 // =============================================================================
 
@@ -76,7 +62,6 @@ module full_system_top (
     output logic done,
 
     // ── Post-processing controls ──────────────────────────────────────────
-    // quant_shift_amt REMOVED in rev 7 — now driven by shift_buffer.
     input  logic               relu_en,
 
     // ── Feedback control ──────────────────────────────────────────────────
@@ -98,16 +83,15 @@ module full_system_top (
     output logic [31:0] cpu_omem_rd_data,
 
     // ── CPU/DMA: shift_buffer write ───────────────────────────────────────
-    // Preload the shift table before asserting start.
-    // cpu_sbuf_wr_addr is a WORD address (= desired_entry_index >> 2).
-    // Each 32-bit word packs four consecutive 8-bit signed shift values:
-    //   bits [7:0]   → entry (addr×4 + 0)
-    //   bits [15:8]  → entry (addr×4 + 1)
-    //   bits [23:16] → entry (addr×4 + 2)
-    //   bits [31:24] → entry (addr×4 + 3)
-    input  logic [11:0] cpu_sbuf_wr_addr,  // 12-bit word addr → 4096 words → 16384 entries
+    input  logic [11:0] cpu_sbuf_wr_addr,
     input  logic [31:0] cpu_sbuf_wr_data,
     input  logic        cpu_sbuf_wr_en,
+
+    // ── CPU/DMA: bias_buffer write (NEW rev 9) ────────────────────────────
+    // 32-bit bus; one entry per write.  Entry address = entry index directly.
+    input  logic [11:0] cpu_bbuf_wr_addr,  // 12-bit address → 4096 entries
+    input  logic [31:0] cpu_bbuf_wr_data,
+    input  logic        cpu_bbuf_wr_en,
 
     // ── MWU trigger (MHA only) ────────────────────────────────────────────
     output logic        mha_window_done,
@@ -120,13 +104,14 @@ module full_system_top (
 // =============================================================================
 // Localparams
 // =============================================================================
-localparam int WAW = 16;
-localparam int FAW = 17;
-localparam int OAW = 19;
-localparam int SB_AW = 14;   // shift_buffer entry address width
+localparam int WAW    = 16;
+localparam int FAW    = 17;
+localparam int OAW    = 19;
+localparam int SB_AW  = 14;    // shift_buffer entry address width
+localparam int BB_AW  = 12;    // bias_buffer  entry address width
 
 // =============================================================================
-// Unified controller output wires
+// Unified controller output wires (unchanged from rev 8 except BB additions)
 // =============================================================================
 
 logic [WAW-1:0] ctrl_wmem_rd_addr;
@@ -158,7 +143,6 @@ logic           ctrl_ibuf_swap;
 logic           ctrl_ibuf_l1_capture_en;
 logic [8:0]     ctrl_ibuf_l1_col_wr;
 
-// MHA ibuf ports
 logic           ctrl_ibuf_mha_load_en;
 logic [5:0]     ctrl_ibuf_mha_load_patch;
 logic [4:0]     ctrl_ibuf_mha_load_k_word;
@@ -175,10 +159,15 @@ logic [2:0]     ctrl_obuf_rd_idx;
 
 logic           ctrl_omem_fb_en;
 
-// ── Shift buffer controller wires (new in rev 7) ──────────────────────────
+// ── Shift buffer controller wires ────────────────────────────────────────
 logic               ctrl_sb_op_start;
 logic [SB_AW-1:0]   ctrl_sb_op_base_addr;
 logic               ctrl_sb_advance;
+
+// ── Bias buffer controller wires (NEW rev 9) ─────────────────────────────
+logic               ctrl_bb_op_start;
+logic [BB_AW-1:0]   ctrl_bb_op_base_addr;
+logic               ctrl_bb_advance;
 
 // =============================================================================
 // Physical memory wires
@@ -194,7 +183,7 @@ logic           omem_fb_rd_en;
 logic [31:0]    omem_fb_rd_data;
 
 // =============================================================================
-// Feedback path mux
+// Feedback path mux (unchanged)
 // =============================================================================
 logic omem_fb_sel;
 assign omem_fb_sel = omem_fb_en | ctrl_omem_fb_en;
@@ -206,8 +195,8 @@ always_ff @(posedge clk or negedge rst_n) begin
 end
 
 always_comb begin
-    fib_rd_addr    = '0; fib_rd_en    = 1'b0;
-    omem_fb_rd_addr= '0; omem_fb_rd_en= 1'b0;
+    fib_rd_addr     = '0; fib_rd_en     = 1'b0;
+    omem_fb_rd_addr = '0; omem_fb_rd_en = 1'b0;
     if (!omem_fb_sel) begin
         fib_rd_addr = ctrl_imem_rd_addr[FAW-1:0];
         fib_rd_en   = ctrl_imem_rd_en;
@@ -220,7 +209,7 @@ end
 assign ctrl_imem_rd_data = omem_fb_sel_d ? omem_fb_rd_data : fib_rd_data;
 
 // =============================================================================
-// MHA window-done strobe
+// MHA window-done strobe (unchanged)
 // =============================================================================
 logic omem_wr_en_d;
 always_ff @(posedge clk or negedge rst_n) begin
@@ -230,7 +219,7 @@ end
 assign mha_window_done = (mode == 2'b10) && omem_wr_en_d && !ctrl_omem_wr_en;
 
 // =============================================================================
-// GCU start strobe
+// GCU start strobe (unchanged)
 // =============================================================================
 logic mmu_valid_in_d;
 always_ff @(posedge clk or negedge rst_n) begin
@@ -244,9 +233,13 @@ assign gcu_start = (mode == 2'b10)
 // =============================================================================
 // Unified buffers → MMU bus wires
 // =============================================================================
-logic [7:0]  ubuf_w_out   [0:11][0:3];
-logic [31:0] ubuf_bias_out;
-logic [7:0]  ubuf_in_out  [0:11][0:6][0:3];
+logic [7:0]  ubuf_w_out    [0:11][0:3];
+logic [31:0] ubuf_bias_out;                 // retained but no longer drives MMU
+logic [7:0]  ubuf_in_out   [0:11][0:6][0:3];
+
+// bias_buffer output (NEW rev 9)
+logic [31:0] bbuf_bias_out [0:6];           // 7 per-column biases → MMU
+logic        bbuf_bias_ready;               // status: bias_reg valid
 
 // =============================================================================
 // MMU wires
@@ -254,49 +247,43 @@ logic [7:0]  ubuf_in_out  [0:11][0:6][0:3];
 logic        mmu_valid_out;
 logic [7:0]  mmu_in_bus   [0:11][0:6][0:3];
 logic [7:0]  mmu_w_bus    [0:11][0:3];
-logic [31:0] mmu_bias_bus [0:11];
+logic [31:0] mmu_bias_bus [0:6];            // ← [0:6] now (was [0:11])
 logic [31:0] mmu_out      [0:6];
 
 // =============================================================================
-// Output buffer / post-processing wires
+// Output buffer / post-processing wires (unchanged)
 // =============================================================================
 logic [31:0]        obuf_rd_data;
-logic [31:0]        obuf_raw_rd_data;   // NEW rev 8: raw (no post-proc) from output_buffer
+logic [31:0]        obuf_raw_rd_data;
 logic signed [31:0] quant_data;
 logic signed [31:0] relu_data;
 logic signed [31:0] post_proc_data;
 
-// ── MHA ILB bypass control (NEW rev 8) ────────────────────────────────────
-// When in MHA mode all output_memory writes go through the raw data path,
-// bypassing the quantiser and ReLU.  The single-bit mux inside output_memory
-// (ilb_wr_bypass) selects between post_proc_data and obuf_raw_rd_data.
-//
-// If finer-grained control is needed (e.g. quantise the final FFN2 output
-// before off-chip transfer), the unified_controller can expose a dedicated
-// ctrl_ilb_wr_bypass output and replace the expression below.
 logic ctrl_ilb_wr_bypass;
 assign ctrl_ilb_wr_bypass = (mode == 2'b10);
 
-// ── Shift buffer → quantizer ──────────────────────────────────────────────
-logic signed [7:0]  sbuf_shift_amt;   // drives rounding_shifter.shift_amt
+logic signed [7:0]  sbuf_shift_amt;
 
 // =============================================================================
 // MMU bus wiring
+// ── Rev 9: mmu_bias_bus[0:6] driven by bias_buffer (bbuf_bias_out) ────────
+// ── Rev 8: mmu_bias_bus was driven by ubuf_bias_out (scalar broadcast)
 // =============================================================================
 always_comb begin
     for (int p = 0; p < 12; p++) begin
         for (int t = 0; t < 4; t++)
             mmu_w_bus[p][t] = ubuf_w_out[p][t];
-        mmu_bias_bus[p] = (p == 0) ? ubuf_bias_out : 32'd0;
         for (int w = 0; w < 7; w++)
             for (int t = 0; t < 4; t++)
                 mmu_in_bus[p][w][t] = ubuf_in_out[p][w][t];
     end
+    // Per-column bias from bias_buffer
+    for (int k = 0; k < 7; k++)
+        mmu_bias_bus[k] = bbuf_bias_out[k];
 end
 
 // =============================================================================
-// Instance: unified_controller
-// — Three new SB parameters and three new SB output ports added in rev 7.
+// Instance: unified_controller  (rev 9 additions: BB ports)
 // =============================================================================
 unified_controller #(
     .WAW      (WAW),
@@ -318,11 +305,17 @@ unified_controller #(
     .ILB_A_BASE   (16468),
     .ILB_PROJ_BASE(19540),
     .ILB_FFN1_BASE(20588),
-    // ── Shift buffer parameters (NEW rev 7) ──────────────────────────────
-    .SB_AW        (SB_AW),    // 14 — matches shift_buffer DEPTH=16384
-    .SB_CONV_BASE (0),        // Conv shift table base entry
-    .SB_MLP_BASE  (5376),     // MLP shift table base entry
-    .SB_MHA_BASE  (5824)      // MHA per-window shift table base entry
+    // Shift buffer parameters
+    .SB_AW        (SB_AW),
+    .SB_CONV_BASE (0),
+    .SB_MLP_BASE  (5376),
+    .SB_MHA_BASE  (5824),
+    // ── Bias buffer parameters (NEW rev 9) ──────────────────────────────
+    .BB_AW           (BB_AW),
+    .BB_CONV_BASE    (0),
+    .BB_MLP_L1_BASE  (96),
+    .BB_MLP_L2_BASE  (480),
+    .BB_MHA_QKT_BASE (576)
 ) u_ctrl (
     .clk                  (clk),
     .rst_n                (rst_n),
@@ -352,8 +345,8 @@ unified_controller #(
     .wbuf_load_pe_idx     (ctrl_wbuf_load_pe_idx),
     .wbuf_load_k_word     (ctrl_wbuf_load_k_word),
     .wbuf_load_data       (ctrl_wbuf_load_data),
-    .wbuf_bias_load_en    (ctrl_wbuf_bias_load_en),
-    .wbuf_bias_load_data  (ctrl_wbuf_bias_load_data),
+    .wbuf_bias_load_en    (ctrl_wbuf_bias_load_en),   // retained (see note D)
+    .wbuf_bias_load_data  (ctrl_wbuf_bias_load_data), // retained (see note D)
     .wbuf_swap            (ctrl_wbuf_swap),
 
     .ibuf_load_en         (ctrl_ibuf_load_en),
@@ -382,14 +375,26 @@ unified_controller #(
 
     .omem_fb_en_ctrl      (ctrl_omem_fb_en),
 
-    // ── Shift buffer outputs (NEW rev 7) ─────────────────────────────────
+    // Shift buffer outputs
     .sb_op_start          (ctrl_sb_op_start),
     .sb_op_base_addr      (ctrl_sb_op_base_addr),
-    .sb_advance           (ctrl_sb_advance)
+    .sb_advance           (ctrl_sb_advance),
+
+    // ── Bias buffer outputs (NEW rev 9) ──────────────────────────────────
+    .bb_op_start          (ctrl_bb_op_start),
+    .bb_op_base_addr      (ctrl_bb_op_base_addr),
+    .bb_advance           (ctrl_bb_advance),
+
+    // Mask buffer ports (unchanged from rev 4)
+    .qkt_store_done       (),
+    .mask_next_window     (),
+    .mask_valid           (1'b0),
+    .mask_window_idx      ('0),
+    .mask_all_done        (1'b0)
 );
 
 // =============================================================================
-// Instance: weight_memory
+// Instance: weight_memory (unchanged)
 // =============================================================================
 weight_memory #(.AW(WAW)) u_wmem (
     .clk     (clk),
@@ -403,7 +408,7 @@ weight_memory #(.AW(WAW)) u_wmem (
 );
 
 // =============================================================================
-// Instance: fib_memory
+// Instance: fib_memory (unchanged)
 // =============================================================================
 fib_memory u_fib (
     .clk     (clk),
@@ -417,19 +422,15 @@ fib_memory u_fib (
 );
 
 // =============================================================================
-// Instance: output_memory (also ILB for MHA)
-// ── Rev 8 additions ──────────────────────────────────────────────────────
-//   ilb_raw_wr_data : obuf_raw_rd_data — raw accumulator from output_buffer,
-//                     bypasses quantiser/ReLU for all MHA intermediate stores.
-//   ilb_wr_bypass   : ctrl_ilb_wr_bypass — 1 in MHA mode, 0 in Conv/MLP.
+// Instance: output_memory (unchanged from rev 8)
 // =============================================================================
 output_memory u_omem (
     .clk             (clk),
     .rst_n           (rst_n),
     .wr_addr         (ctrl_omem_wr_addr),
-    .wr_data         (post_proc_data),      // post_proc path (Conv/MLP)
-    .ilb_raw_wr_data (obuf_raw_rd_data),    // raw path       (MHA)
-    .ilb_wr_bypass   (ctrl_ilb_wr_bypass),  // select raw when in MHA mode
+    .wr_data         (post_proc_data),
+    .ilb_raw_wr_data (obuf_raw_rd_data),
+    .ilb_wr_bypass   (ctrl_ilb_wr_bypass),
     .wr_en           (ctrl_omem_wr_en),
     .cpu_rd_addr     (cpu_omem_rd_addr),
     .cpu_rd_en       (cpu_omem_rd_en),
@@ -440,7 +441,7 @@ output_memory u_omem (
 );
 
 // =============================================================================
-// Instance: unified_weight_buf
+// Instance: unified_weight_buf (unchanged)
 // =============================================================================
 unified_weight_buf u_wbuf (
     .clk                 (clk),
@@ -460,11 +461,11 @@ unified_weight_buf u_wbuf (
 
     .sub_cycle           (ctrl_mmu_sub_cycle),
     .w_out               (ubuf_w_out),
-    .bias_out            (ubuf_bias_out)
+    .bias_out            (ubuf_bias_out)    // no longer drives MMU (see note 5)
 );
 
 // =============================================================================
-// Instance: unified_input_buf
+// Instance: unified_input_buf (unchanged)
 // =============================================================================
 unified_input_buf u_ibuf (
     .clk                 (clk),
@@ -497,7 +498,7 @@ unified_input_buf u_ibuf (
 );
 
 // =============================================================================
-// Instance: mmu_top  (UNTOUCHED — no changes in rev 7)
+// Instance: mmu_top  (rev 2 — 7-bias interface)
 // =============================================================================
 mmu_top u_mmu (
     .clk       (clk),
@@ -508,15 +509,12 @@ mmu_top u_mmu (
     .valid_out (mmu_valid_out),
     .mmu_in    (mmu_in_bus),
     .mmu_w     (mmu_w_bus),
-    .mmu_bias  (mmu_bias_bus),
+    .mmu_bias  (mmu_bias_bus),     // [0:6] — driven by bias_buffer
     .mmu_out   (mmu_out)
 );
 
 // =============================================================================
-// Instance: output_buffer
-// ── Rev 8 addition ───────────────────────────────────────────────────────
-//   raw_rd_data : obuf_raw_rd_data — separate wire for raw ILB write path.
-//   rd_data     : obuf_rd_data     — unchanged; still feeds post_proc chain.
+// Instance: output_buffer (unchanged from rev 8)
 // =============================================================================
 output_buffer u_obuf (
     .clk         (clk),
@@ -525,45 +523,62 @@ output_buffer u_obuf (
     .mmu_out     (mmu_out),
     .rd_idx      (ctrl_obuf_rd_idx),
     .rd_data     (obuf_rd_data),
-    .raw_rd_data (obuf_raw_rd_data)    // NEW rev 8: to output_memory.ilb_raw_wr_data
+    .raw_rd_data (obuf_raw_rd_data)
 );
 
 // =============================================================================
-// Instance: shift_buffer  (NEW in rev 7)
-//
-// Holds up to 16 384 pre-loaded 8-bit shift values (4 packed per 32-bit word).
-// The controller drives sb_op_start / sb_op_base_addr to arm the buffer at the
-// correct table base whenever a new operation or MHA window begins.
-// sb_advance steps the read pointer by one after each 7-element row-group
-// writeback so shift_amt is always valid for the upcoming row-group.
+// Instance: shift_buffer (unchanged from rev 7)
 // =============================================================================
 shift_buffer #(
-    .DEPTH (16384),    // 16 384 entries → 4 096 × 32-bit words → 12-bit word addr
-    .DW    (8)         // must match rounding_shifter W_SHIFT
+    .DEPTH (16384),
+    .DW    (8)
 ) u_sbuf (
     .clk             (clk),
     .rst_n           (rst_n),
-    // CPU preload port
-    .cpu_wr_addr     (cpu_sbuf_wr_addr),   // 12-bit word address
+    .cpu_wr_addr     (cpu_sbuf_wr_addr),
     .cpu_wr_data     (cpu_sbuf_wr_data),
     .cpu_wr_en       (cpu_sbuf_wr_en),
-    // Controller
     .sb_op_start     (ctrl_sb_op_start),
     .sb_op_base_addr (ctrl_sb_op_base_addr),
     .sb_advance      (ctrl_sb_advance),
-    // Output
     .shift_amt       (sbuf_shift_amt)
 );
 
 // =============================================================================
-// Post-processing pipeline
-//
-// rounding_shifter.shift_amt now comes from u_sbuf rather than the old
-// top-level quant_shift_amt port (removed in rev 7).
+// Instance: bias_buffer  (NEW rev 9)
+// =============================================================================
+bias_buffer #(
+    .AW             (BB_AW),         // 12-bit address → 4096 entries
+    .DW             (32),
+    .BB_CONV_BASE   (0),
+    .BB_MLP_L1_BASE (96),
+    .BB_MLP_L2_BASE (480),
+    .BB_MHA_QKT_BASE(576)
+) u_bbuf (
+    .clk              (clk),
+    .rst_n            (rst_n),
+    // CPU/DMA preload
+    .cpu_wr_addr      (cpu_bbuf_wr_addr),
+    .cpu_wr_data      (cpu_bbuf_wr_data),
+    .cpu_wr_en        (cpu_bbuf_wr_en),
+    // Controller
+    .mode             (mode),
+    .mmu_op_code      (ctrl_mmu_op_code),
+    .bb_op_start      (ctrl_bb_op_start),
+    .bb_op_base_addr  (ctrl_bb_op_base_addr),
+    .bb_advance       (ctrl_bb_advance),
+    // Status
+    .bias_ready       (bbuf_bias_ready),   // internal; used by controller
+    // Output
+    .bias_out         (bbuf_bias_out)      // → mmu_bias_bus[0:6]
+);
+
+// =============================================================================
+// Post-processing pipeline (unchanged from rev 8)
 // =============================================================================
 rounding_shifter #(.W_INPUT(32), .W_SHIFT(8)) u_quantizer (
     .in_value  ($signed(obuf_rd_data)),
-    .shift_amt (sbuf_shift_amt),          // ← driven by shift_buffer (was quant_shift_amt)
+    .shift_amt (sbuf_shift_amt),
     .out_value (quant_data)
 );
 
@@ -580,3 +595,6 @@ post_proc_mux #(.W(32)) u_mux (
 );
 
 endmodule
+// =============================================================================
+// End of full_system_top.sv  (rev 9)
+// =============================================================================
